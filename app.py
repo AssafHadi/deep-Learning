@@ -1,13 +1,16 @@
 # UI_test.py (Single-file: UI + ANN backend + MULTIVARIATE LSTM backend)
+# ✅ SAFE LSTM + PROFESSIONAL VISUALIZE
+# ✅ SPEED UPDATE: Lazy import sklearn + matplotlib + tensorflow (faster startup / faster page switching)
+
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from dataclasses import dataclass
-import os
 
 # Quiet TF noise (optional, safe)
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
@@ -15,30 +18,108 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
-
 import joblib
-import tensorflow as tf
 
-from sklearn.model_selection import train_test_split
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder, MinMaxScaler
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import (
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
-    confusion_matrix,
-    mean_absolute_error,
-    mean_squared_error,
-    r2_score,
-)
+# ============================================================
+# Performance: Lazy import caches
+# ============================================================
+_TF_CACHE: Dict[str, Any] = {}
+_SK_CACHE: Dict[str, Any] = {}
+_PLT_CACHE: Dict[str, Any] = {}
 
-from tensorflow.keras import layers
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.callbacks import EarlyStopping
+
+def _get_tf():
+    """Lazy-load TensorFlow only when training/loading models is needed."""
+    if "tf" in _TF_CACHE:
+        return _TF_CACHE["tf"]
+
+    import tensorflow as tf  # heavy
+    from tensorflow.keras import layers
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.callbacks import EarlyStopping
+
+    _TF_CACHE["tf"] = tf
+    _TF_CACHE["layers"] = layers
+    _TF_CACHE["Sequential"] = Sequential
+    _TF_CACHE["EarlyStopping"] = EarlyStopping
+    return tf
+
+
+def _get_tf_keras():
+    """Returns (tf, layers, Sequential, EarlyStopping) lazily."""
+    tf = _get_tf()
+    return tf, _TF_CACHE["layers"], _TF_CACHE["Sequential"], _TF_CACHE["EarlyStopping"]
+
+
+def _get_sklearn():
+    """Lazy-load scikit-learn only when training/evaluation uses it."""
+    if _SK_CACHE.get("loaded"):
+        return _SK_CACHE
+
+    from sklearn.model_selection import train_test_split
+    from sklearn.compose import ColumnTransformer
+    from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder, MinMaxScaler
+    from sklearn.pipeline import Pipeline
+    from sklearn.impute import SimpleImputer
+    from sklearn.metrics import (
+        accuracy_score,
+        precision_score,
+        recall_score,
+        f1_score,
+        confusion_matrix,
+        mean_absolute_error,
+        mean_squared_error,
+        r2_score,
+    )
+
+    _SK_CACHE.update(
+        {
+            "loaded": True,
+            "train_test_split": train_test_split,
+            "ColumnTransformer": ColumnTransformer,
+            "OneHotEncoder": OneHotEncoder,
+            "StandardScaler": StandardScaler,
+            "LabelEncoder": LabelEncoder,
+            "MinMaxScaler": MinMaxScaler,
+            "Pipeline": Pipeline,
+            "SimpleImputer": SimpleImputer,
+            "accuracy_score": accuracy_score,
+            "precision_score": precision_score,
+            "recall_score": recall_score,
+            "f1_score": f1_score,
+            "confusion_matrix": confusion_matrix,
+            "mean_absolute_error": mean_absolute_error,
+            "mean_squared_error": mean_squared_error,
+            "r2_score": r2_score,
+        }
+    )
+    return _SK_CACHE
+
+
+def _get_plt():
+    """Lazy-load matplotlib only when Visualize page is rendered."""
+    if "plt" in _PLT_CACHE:
+        return _PLT_CACHE["plt"]
+    import matplotlib.pyplot as plt  # heavy-ish
+    _PLT_CACHE["plt"] = plt
+    return plt
+
+
+# ============================================================
+# JSON-safe utilities (fix "not JSON serializable" forever)
+# ============================================================
+def _json_safe(obj: Any) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, (np.generic,)):
+        return obj.item()
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(x) for x in obj]
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    return str(obj)
 
 
 # ============================================================
@@ -54,14 +135,6 @@ def _safe_index(options: List[Any], value: Any, default: int = 0) -> int:
 def _clamp_int(x: Any, lo: int, hi: int, default: int) -> int:
     try:
         v = int(x)
-        return max(lo, min(hi, v))
-    except Exception:
-        return default
-
-
-def _clamp_float(x: Any, lo: float, hi: float, default: float) -> float:
-    try:
-        v = float(x)
         return max(lo, min(hi, v))
     except Exception:
         return default
@@ -146,24 +219,35 @@ def _expand_datetime_features(X: pd.DataFrame) -> pd.DataFrame:
     return X
 
 
-def _make_preprocessor(X: pd.DataFrame) -> Tuple[ColumnTransformer, List[str], List[str]]:
+def _make_preprocessor(X: pd.DataFrame):
+    sk = _get_sklearn()
+    ColumnTransformer = sk["ColumnTransformer"]
+    OneHotEncoder = sk["OneHotEncoder"]
+    StandardScaler = sk["StandardScaler"]
+    Pipeline = sk["Pipeline"]
+    SimpleImputer = sk["SimpleImputer"]
+
     numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
     categorical_cols = [c for c in X.columns if c not in numeric_cols]
 
-    num_pipe = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler()),
-    ])
+    num_pipe = Pipeline(
+        [
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ]
+    )
 
     try:
         ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
     except TypeError:
         ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
 
-    cat_pipe = Pipeline([
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", ohe),
-    ])
+    cat_pipe = Pipeline(
+        [
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("onehot", ohe),
+        ]
+    )
 
     preprocessor = ColumnTransformer(
         transformers=[
@@ -192,7 +276,9 @@ def _build_ann_model(
     n_classes: int,
     ann_config: Optional[Dict[str, Any]],
     lr: float,
-) -> tf.keras.Model:
+):
+    tf, layers, _, _ = _get_tf_keras()
+
     ann_config = ann_config or {}
     hidden_layers = _clamp_int(ann_config.get("hidden_layers", 3), 1, 12, 3)
 
@@ -250,7 +336,21 @@ def train_ann_from_df(
     patience: int = 5,
     seed: int = 42,
     ann_config: Optional[Dict[str, Any]] = None,
-) -> Tuple[tf.keras.Model, ColumnTransformer, Optional[LabelEncoder], Dict[str, Any], Dict[str, List[float]]]:
+):
+    sk = _get_sklearn()
+    train_test_split = sk["train_test_split"]
+    LabelEncoder = sk["LabelEncoder"]
+    accuracy_score = sk["accuracy_score"]
+    precision_score = sk["precision_score"]
+    recall_score = sk["recall_score"]
+    f1_score = sk["f1_score"]
+    confusion_matrix = sk["confusion_matrix"]
+    mean_absolute_error = sk["mean_absolute_error"]
+    mean_squared_error = sk["mean_squared_error"]
+    r2_score = sk["r2_score"]
+
+    tf = _get_tf()
+
     df = df.dropna(axis=1, how="all").dropna(axis=0, how="all").copy()
 
     if target_col not in df.columns:
@@ -268,12 +368,14 @@ def train_ann_from_df(
     if task == "unknown":
         raise ValueError("Target column is empty after removing NA.")
 
-    label_encoder: Optional[LabelEncoder] = None
+    label_encoder: Optional[Any] = None
 
     if task == "classification":
         label_encoder = LabelEncoder()
         y_enc = label_encoder.fit_transform(y.astype(str).fillna("NA"))
         n_classes = int(len(label_encoder.classes_))
+        if n_classes < 2:
+            raise ValueError("Classification requires at least 2 classes in target.")
 
         stratify = y_enc if n_classes >= 2 else None
         X_train, X_test, y_train, y_test = train_test_split(
@@ -284,6 +386,8 @@ def train_ann_from_df(
         keep = ~np.isnan(y_enc)
         X = X.loc[keep].reset_index(drop=True)
         y_enc = y_enc[keep]
+        if len(y_enc) < 2:
+            raise ValueError("Regression has too few usable numeric rows after cleaning.")
         n_classes = 1
 
         X_train, X_test, y_train, y_test = train_test_split(
@@ -294,6 +398,8 @@ def train_ann_from_df(
 
     X_train_np = preprocessor.fit_transform(X_train)
     X_test_np = preprocessor.transform(X_test)
+    if X_train_np.shape[1] < 1:
+        raise ValueError("After preprocessing, there are 0 usable input features.")
 
     model = _build_ann_model(
         input_dim=int(X_train_np.shape[1]),
@@ -305,9 +411,9 @@ def train_ann_from_df(
 
     callbacks = []
     if early_stop:
-        callbacks.append(tf.keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=patience, restore_best_weights=True
-        ))
+        callbacks.append(
+            tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=patience, restore_best_weights=True)
+        )
 
     history_obj = model.fit(
         X_train_np,
@@ -334,22 +440,26 @@ def train_ann_from_df(
         else:
             y_pred = np.argmax(probs, axis=1)
 
-        results.update({
-            "accuracy": float(accuracy_score(y_test, y_pred)),
-            "precision": float(precision_score(y_test, y_pred, average="weighted", zero_division=0)),
-            "recall": float(recall_score(y_test, y_pred, average="weighted", zero_division=0)),
-            "f1_score": float(f1_score(y_test, y_pred, average="weighted", zero_division=0)),
-            "confusion_matrix": confusion_matrix(y_test, y_pred).tolist(),
-            "classes": int(n_classes),
-            "class_labels": label_encoder.classes_.tolist() if label_encoder is not None else None,
-        })
+        results.update(
+            {
+                "accuracy": float(accuracy_score(y_test, y_pred)),
+                "precision": float(precision_score(y_test, y_pred, average="weighted", zero_division=0)),
+                "recall": float(recall_score(y_test, y_pred, average="weighted", zero_division=0)),
+                "f1_score": float(f1_score(y_test, y_pred, average="weighted", zero_division=0)),
+                "confusion_matrix": confusion_matrix(y_test, y_pred).tolist(),
+                "classes": int(n_classes),
+                "class_labels": label_encoder.classes_.tolist() if label_encoder is not None else None,
+            }
+        )
     else:
         preds = model.predict(X_test_np, verbose=0).reshape(-1)
-        results.update({
-            "mae": float(mean_absolute_error(y_test, preds)),
-            "rmse": float(np.sqrt(mean_squared_error(y_test, preds))),
-            "r2_score": float(r2_score(y_test, preds)),
-        })
+        results.update(
+            {
+                "mae": float(mean_absolute_error(y_test, preds)),
+                "rmse": float(np.sqrt(mean_squared_error(y_test, preds))),
+                "r2_score": float(r2_score(y_test, preds)) if len(y_test) >= 2 else 0.0,
+            }
+        )
 
     return model, preprocessor, label_encoder, results, {
         "loss": [float(x) for x in history.get("loss", [])],
@@ -359,10 +469,10 @@ def train_ann_from_df(
 
 def predict_from_df(
     df_features: pd.DataFrame,
-    model: tf.keras.Model,
-    preprocessor: ColumnTransformer,
+    model,
+    preprocessor,
     task: str,
-    label_encoder: Optional[LabelEncoder] = None,
+    label_encoder: Optional[Any] = None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     X = _expand_datetime_features(df_features)
     X_np = preprocessor.transform(X)
@@ -387,8 +497,31 @@ def predict_from_df(
 
 
 # ============================================================
-# MULTIVARIATE LSTM BACKEND
+# MULTIVARIATE LSTM BACKEND (SAFE PATCH ✅ never crashes UI)
 # ============================================================
+def _clean_df_minimal(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
+    return df
+
+
+def _smart_split_sizes(n: int, test_size: float) -> Tuple[float, List[str]]:
+    warns: List[str] = []
+    test_size = float(test_size)
+    test_size = min(max(test_size, 0.05), 0.5)
+
+    if n < 2:
+        return test_size, warns
+
+    test_count = int(np.ceil(n * test_size))
+    train_count = n - test_count
+    if train_count < 1:
+        test_count = n - 1
+        test_size = test_count / n
+        warns.append(f"Auto-adjusted test split because dataset is very small (n={n}).")
+    return test_size, warns
+
+
 @dataclass
 class LSTMConfig:
     target_col: str
@@ -410,6 +543,7 @@ class LSTMConfig:
 
 
 def _set_seed(seed: int) -> None:
+    tf = _get_tf()
     np.random.seed(seed)
     tf.random.set_seed(seed)
 
@@ -422,12 +556,15 @@ def _coerce_numeric_series(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce").astype(float)
 
 
-def _prepare_multivariate_frame(
+def _prepare_multivariate_frame_safe(
     df: pd.DataFrame,
     target_col: str,
     feature_cols: List[str],
     date_col: Optional[str],
-) -> Tuple[pd.DataFrame, List[str]]:
+) -> Tuple[pd.DataFrame, List[str], List[str]]:
+    warns: List[str] = []
+
+    df = _clean_df_minimal(df)
     if target_col not in df.columns:
         raise ValueError(f"Target column '{target_col}' not found.")
     for c in feature_cols:
@@ -438,12 +575,14 @@ def _prepare_multivariate_frame(
 
     if date_col and date_col in work.columns:
         work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+        before = len(work)
         work = work.dropna(subset=[date_col])
+        if len(work) < before:
+            warns.append("Dropped rows with invalid time values in the time column.")
         work = work.sort_values(date_col)
 
     X = work[feature_cols].copy()
     X = _expand_datetime_features(X)
-
     X = pd.get_dummies(X, dummy_na=True)
 
     y = _coerce_numeric_series(work[target_col])
@@ -459,7 +598,7 @@ def _prepare_multivariate_frame(
         raise ValueError(f"After cleaning, only {len(aligned)} usable rows remain. Need more data for LSTM.")
 
     input_cols = [c for c in aligned.columns if c != "_target_"] + ["_target_"]
-    return aligned, input_cols
+    return aligned, input_cols, warns
 
 
 def make_sequences_multivariate(arr: np.ndarray, lookback: int, horizon: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -473,25 +612,25 @@ def make_sequences_multivariate(arr: np.ndarray, lookback: int, horizon: int) ->
     X, y = [], []
     target_idx = arr.shape[1] - 1
     for i in range(lookback, len(arr) - horizon + 1):
-        X.append(arr[i - lookback:i, :])
+        X.append(arr[i - lookback : i, :])
         y.append(arr[i + horizon - 1, target_idx])
 
-    X = np.array(X, dtype=np.float32)
-    y = np.array(y, dtype=np.float32)
-    return X, y
+    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
 
 
-def build_lstm_multivariate(lookback: int, n_channels: int, lstm_units: int, dropout: float) -> tf.keras.Model:
+def build_lstm_multivariate(lookback: int, n_channels: int, lstm_units: int, dropout: float):
+    _, layers, Sequential, _ = _get_tf_keras()
     model = Sequential(
         [
             layers.Input(shape=(lookback, n_channels)),
-            layers.LSTM(lstm_units, return_sequences=True),
-            layers.Dropout(dropout),
-            layers.LSTM(lstm_units),
-            layers.Dropout(dropout),
+            layers.LSTM(int(lstm_units), return_sequences=True),
+            layers.Dropout(float(dropout)),
+            layers.LSTM(int(lstm_units)),
+            layers.Dropout(float(dropout)),
             layers.Dense(1),
         ]
     )
+    tf = _get_tf()
     optimizer = tf.keras.optimizers.Adam(learning_rate=0.001, clipnorm=1.0)
     model.compile(optimizer=optimizer, loss="mse")
     return model
@@ -499,120 +638,162 @@ def build_lstm_multivariate(lookback: int, n_channels: int, lstm_units: int, dro
 
 def train_lstm_from_df(
     df: pd.DataFrame,
-    cfg: LSTMConfig
-) -> Tuple[tf.keras.Model, Dict[str, Any], Dict[str, list], Dict[str, float], Dict[str, np.ndarray]]:
-    _set_seed(cfg.seed)
+    cfg: LSTMConfig,
+) -> Tuple[Optional[Any], Optional[Dict[str, Any]], Dict[str, list], Dict[str, Any], Dict[str, np.ndarray]]:
+    sk = _get_sklearn()
+    MinMaxScaler = sk["MinMaxScaler"]
+    mean_squared_error = sk["mean_squared_error"]
+    mean_absolute_error = sk["mean_absolute_error"]
+    r2_score = sk["r2_score"]
 
-    aligned, input_cols = _prepare_multivariate_frame(df, cfg.target_col, cfg.feature_cols, cfg.date_col)
+    _, _, _, EarlyStopping = _get_tf_keras()
 
-    Xy = aligned[[c for c in input_cols if c != "_target_"]].to_numpy(dtype=np.float32)
-    y = aligned["_target_"].to_numpy(dtype=np.float32).reshape(-1, 1)
-    full = np.concatenate([Xy, y], axis=1)
+    metrics: Dict[str, Any] = {"status": "ok", "message": "", "warnings": []}
+    history: Dict[str, list] = {"loss": [], "val_loss": []}
+    outputs: Dict[str, np.ndarray] = {}
 
-    split_idx = int(len(full) * (1 - cfg.test_size))
-    split_idx = max(2, min(split_idx, len(full) - 1))
+    try:
+        _set_seed(int(cfg.seed))
 
-    train_full = full[:split_idx]
-    test_full = full[split_idx:]
+        aligned, input_cols, warns = _prepare_multivariate_frame_safe(df, cfg.target_col, cfg.feature_cols, cfg.date_col)
+        metrics["warnings"].extend(warns)
 
-    scaler_all = MinMaxScaler(feature_range=(0, 1))
-    scaler_y = MinMaxScaler(feature_range=(0, 1))
+        Xy = aligned[[c for c in input_cols if c != "_target_"]].to_numpy(dtype=np.float32)
+        y = aligned["_target_"].to_numpy(dtype=np.float32).reshape(-1, 1)
+        full = np.concatenate([Xy, y], axis=1)
 
-    train_scaled = scaler_all.fit_transform(train_full)
-    test_scaled = scaler_all.transform(test_full)
+        n = len(full)
+        test_size_adj, warns2 = _smart_split_sizes(n, cfg.test_size)
+        metrics["warnings"].extend(warns2)
 
-    scaler_y.fit(train_full[:, [-1]])
+        split_idx = int(n * (1 - test_size_adj))
+        split_idx = max(2, min(split_idx, n - 1))
 
-    scaled_full = np.vstack([train_scaled, test_scaled]).astype(np.float32)
+        train_full = full[:split_idx]
+        test_full = full[split_idx:]
 
-    lookback = int(cfg.lookback)
-    horizon = int(cfg.horizon)
-    if len(scaled_full) <= lookback + horizon:
-        lookback = max(1, len(scaled_full) - horizon - 1)
+        scaler_all = MinMaxScaler(feature_range=(0, 1))
+        scaler_y = MinMaxScaler(feature_range=(0, 1))
 
-    X_seq, y_seq = make_sequences_multivariate(scaled_full, lookback=lookback, horizon=horizon)
+        train_scaled = scaler_all.fit_transform(train_full)
+        test_scaled = scaler_all.transform(test_full)
 
-    seq_split = int(len(X_seq) * (1 - cfg.test_size))
-    seq_split = max(1, min(seq_split, len(X_seq) - 1))
+        scaler_y.fit(train_full[:, [-1]])
+        scaled_full = np.vstack([train_scaled, test_scaled]).astype(np.float32)
 
-    X_train, y_train = X_seq[:seq_split], y_seq[:seq_split]
-    X_test, y_test = X_seq[seq_split:], y_seq[seq_split:]
+        lookback = int(cfg.lookback)
+        horizon = int(cfg.horizon)
 
-    n_channels = int(X_train.shape[2])
-    model = build_lstm_multivariate(lookback, n_channels, cfg.lstm_units, cfg.dropout)
+        if len(scaled_full) <= lookback + horizon:
+            lookback = max(1, len(scaled_full) - horizon - 1)
+            metrics["warnings"].append("Auto-reduced lookback due to limited data length.")
 
-    cb = EarlyStopping(monitor="val_loss", patience=cfg.patience, restore_best_weights=True)
-    hist = model.fit(
-        X_train,
-        y_train,
-        epochs=cfg.epochs,
-        batch_size=cfg.batch_size,
-        validation_split=cfg.val_split,
-        callbacks=[cb],
-        verbose=0,
-    )
-    history = {k: [float(x) for x in v] for k, v in hist.history.items()}
+        X_seq, y_seq = make_sequences_multivariate(scaled_full, lookback=lookback, horizon=horizon)
 
-    train_pred = model.predict(X_train, verbose=0).reshape(-1, 1)
-    test_pred = model.predict(X_test, verbose=0).reshape(-1, 1)
+        if len(X_seq) < 2:
+            return None, None, history, {
+                "status": "error",
+                "message": "Not enough sequences after preprocessing for LSTM training.",
+                "warnings": metrics.get("warnings", []),
+            }, outputs
 
-    y_train_actual = scaler_y.inverse_transform(y_train.reshape(-1, 1))
-    y_test_actual = scaler_y.inverse_transform(y_test.reshape(-1, 1))
-    train_pred_actual = scaler_y.inverse_transform(train_pred)
-    test_pred_actual = scaler_y.inverse_transform(test_pred)
+        n_seq = len(X_seq)
+        test_size_adj2, warns3 = _smart_split_sizes(n_seq, test_size_adj)
+        metrics["warnings"].extend(warns3)
 
-    y_test_flat = y_test_actual.reshape(-1)
-    pred_flat = test_pred_actual.reshape(-1)
-    mask = np.isfinite(y_test_flat) & np.isfinite(pred_flat)
-    if mask.sum() == 0:
-        rmse = mae = r2 = 0.0
-    else:
-        rmse = float(np.sqrt(mean_squared_error(y_test_flat[mask], pred_flat[mask])))
-        mae = float(mean_absolute_error(y_test_flat[mask], pred_flat[mask]))
+        seq_split = int(n_seq * (1 - test_size_adj2))
+        seq_split = max(1, min(seq_split, n_seq - 1))
+
+        X_train, y_train = X_seq[:seq_split], y_seq[:seq_split]
+        X_test, y_test = X_seq[seq_split:], y_seq[seq_split:]
+
+        model = build_lstm_multivariate(
+            lookback=lookback,
+            n_channels=int(X_train.shape[2]),
+            lstm_units=int(cfg.lstm_units),
+            dropout=float(cfg.dropout),
+        )
+
+        cb = EarlyStopping(monitor="val_loss", patience=int(cfg.patience), restore_best_weights=True)
+        hist = model.fit(
+            X_train,
+            y_train,
+            epochs=int(cfg.epochs),
+            batch_size=int(cfg.batch_size),
+            validation_split=float(cfg.val_split),
+            callbacks=[cb],
+            verbose=0,
+        )
+        history = {k: [float(x) for x in v] for k, v in hist.history.items()}
+
+        train_pred = model.predict(X_train, verbose=0).reshape(-1, 1)
+        test_pred = model.predict(X_test, verbose=0).reshape(-1, 1)
+
+        y_train_actual = scaler_y.inverse_transform(y_train.reshape(-1, 1))
+        y_test_actual = scaler_y.inverse_transform(y_test.reshape(-1, 1))
+        train_pred_actual = scaler_y.inverse_transform(train_pred)
+        test_pred_actual = scaler_y.inverse_transform(test_pred)
+
+        y_test_flat = y_test_actual.reshape(-1)
+        pred_flat = test_pred_actual.reshape(-1)
+        mask = np.isfinite(y_test_flat) & np.isfinite(pred_flat)
+
+        rmse = float(np.sqrt(mean_squared_error(y_test_flat[mask], pred_flat[mask]))) if mask.sum() else 0.0
+        mae = float(mean_absolute_error(y_test_flat[mask], pred_flat[mask])) if mask.sum() else 0.0
         try:
-            r2 = float(r2_score(y_test_flat[mask], pred_flat[mask]))
+            r2 = float(r2_score(y_test_flat[mask], pred_flat[mask])) if mask.sum() >= 2 else 0.0
         except Exception:
             r2 = 0.0
 
-    metrics = {
-        "task": "regression",
-        "rmse": rmse,
-        "mae": mae,
-        "r2_score": r2,
-        "lookback_used": int(lookback),
-        "horizon_used": int(horizon),
-        "channels_used": int(n_channels),
-        "rows_used": int(len(aligned)),
-        "train_sequences": int(len(X_train)),
-        "test_sequences": int(len(X_test)),
-    }
+        metrics.update(
+            {
+                "status": "ok",
+                "task": "regression",
+                "rmse": rmse,
+                "mae": mae,
+                "r2_score": r2,
+                "lookback_used": int(lookback),
+                "horizon_used": int(horizon),
+                "channels_used": int(X_train.shape[2]),
+                "rows_used": int(len(aligned)),
+                "train_sequences": int(len(X_train)),
+                "test_sequences": int(len(X_test)),
+            }
+        )
 
-    pack = {
-        "scaler_all": scaler_all,
-        "scaler_y": scaler_y,
-        "input_feature_columns": [c for c in input_cols if c != "_target_"],
-        "target_column": cfg.target_col,
-    }
+        pack = {
+            "scaler_all": scaler_all,
+            "scaler_y": scaler_y,
+            "input_feature_columns": [c for c in input_cols if c != "_target_"],
+            "target_column": cfg.target_col,
+        }
 
-    last_feature_scaled = scaled_full[-1, :-1].astype(np.float32)
+        last_feature_scaled = scaled_full[-1, :-1].astype(np.float32)
 
-    outputs = {
-        "scaled_full": scaled_full.astype(np.float32),
-        "lookback": np.array([lookback], dtype=np.int32),
-        "horizon": np.array([horizon], dtype=np.int32),
-        "last_feature_scaled": last_feature_scaled.astype(np.float32),
-        "y_train_actual": y_train_actual.astype(np.float32),
-        "y_test_actual": y_test_actual.astype(np.float32),
-        "train_pred_actual": train_pred_actual.astype(np.float32),
-        "test_pred_actual": test_pred_actual.astype(np.float32),
-    }
+        outputs = {
+            "scaled_full": scaled_full.astype(np.float32),
+            "lookback": np.array([lookback], dtype=np.int32),
+            "horizon": np.array([horizon], dtype=np.int32),
+            "last_feature_scaled": last_feature_scaled.astype(np.float32),
+            "y_train_actual": y_train_actual.astype(np.float32),
+            "y_test_actual": y_test_actual.astype(np.float32),
+            "train_pred_actual": train_pred_actual.astype(np.float32),
+            "test_pred_actual": test_pred_actual.astype(np.float32),
+        }
 
-    return model, pack, history, metrics, outputs
+        return model, pack, history, metrics, outputs
+
+    except Exception as e:
+        return None, None, history, {
+            "status": "error",
+            "message": f"LSTM training failed: {e}",
+            "warnings": metrics.get("warnings", []),
+        }, outputs
 
 
 def forecast_future_multivariate(
-    model: tf.keras.Model,
-    scaler_y: MinMaxScaler,
+    model,
+    scaler_y,
     scaled_full: np.ndarray,
     lookback: int,
     n_steps: int,
@@ -658,7 +839,8 @@ def _read_json(path: Path, default):
 
 
 def _write_json(path: Path, obj):
-    path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+    safe = _json_safe(obj)
+    path.write_text(json.dumps(safe, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def get_projects() -> List[Dict[str, Any]]:
@@ -736,6 +918,11 @@ def inject_css():
           }
           .badge.good { background: #ecfdf5; border-color:#a7f3d0; color:#065f46; }
           .badge.warn { background: #fffbeb; border-color:#fde68a; color:#92400e; }
+
+          /* Force "same-line" action buttons to look equal */
+          .btn-row > div { width:100%; }
+          .btn-row button { width:100% !important; height: 48px !important; border-radius: 14px !important; }
+
           .btn-grad > button {
             background: linear-gradient(90deg, #06b6d4 0%, #6366f1 100%) !important;
             color: white !important;
@@ -758,14 +945,15 @@ def inject_css():
           @media (min-width: 1024px){ .bottom-nav { display: none; } }
           .bottom-nav .row {
             max-width: 1200px; margin: 0 auto;
-            display: grid; grid-template-columns: repeat(5, 1fr);
-            gap: 8px;
+            display: grid; grid-template-columns: repeat(9, 1fr);
+            gap: 6px;
           }
           .bottom-nav a {
             text-decoration: none; color: #64748b;
-            font-size: 12px; text-align:center;
+            font-size: 11px; text-align:center;
             padding: 8px 6px; border-radius: 14px;
             border: 1px solid transparent;
+            white-space: nowrap;
           }
           .bottom-nav a.active {
             color: #4f46e5;
@@ -821,9 +1009,13 @@ def bottom_nav(active: str):
     items = [
         ("home", "Home"),
         ("data", "Data"),
+        ("preprocess", "Preprocess"),
         ("model", "Model"),
         ("train", "Train"),
+        ("evaluate", "Evaluate"),
         ("predict", "Predict"),
+        ("visualize", "Visualize"),
+        ("save", "Save"),
     ]
     links = []
     for key, label in items:
@@ -863,6 +1055,7 @@ def new_project() -> Dict[str, Any]:
         "evaluation_metrics": None,
         "artifacts": None,
         "feature_meta": {},
+        "target_profile": {},
         "viz_cache": {},
         "ann_config": {"hidden_layers": 3, "neurons": [256, 128, 64], "activation": "ReLU", "output_activation": "Auto"},
         "lstm_config": {"units": 64, "layers": 2, "dropout": 0.2, "bidirectional": False},
@@ -893,6 +1086,7 @@ def cached_load_dataset(path: str, file_type: str, sheet: Optional[str]):
 
 @st.cache_resource(show_spinner=False)
 def cached_load_ann_artifacts(model_path: str, preprocessor_path: str, label_encoder_path: str):
+    tf = _get_tf()
     model = tf.keras.models.load_model(model_path)
     preprocessor = joblib.load(preprocessor_path)
     label_encoder = joblib.load(label_encoder_path)
@@ -901,6 +1095,7 @@ def cached_load_ann_artifacts(model_path: str, preprocessor_path: str, label_enc
 
 @st.cache_resource(show_spinner=False)
 def cached_load_lstm_artifacts(model_path: str, pack_path: str, outputs_path: str):
+    tf = _get_tf()
     model = tf.keras.models.load_model(model_path)
     pack = joblib.load(pack_path)
     outputs = np.load(outputs_path, allow_pickle=False)
@@ -942,6 +1137,37 @@ def build_feature_meta(df: pd.DataFrame, features: List[str]) -> Dict[str, Any]:
 
 
 # ============================================================
+# ✅ Target profile helper (Professional prediction explanation)
+# ============================================================
+def build_target_profile(df: pd.DataFrame, target_col: str) -> Dict[str, Any]:
+    if target_col not in df.columns:
+        return {}
+
+    y = df[target_col].copy()
+
+    y_num = pd.to_numeric(y, errors="coerce")
+    if y_num.notna().sum() >= max(5, int(0.2 * len(y))):
+        yv = y_num.dropna().astype(float)
+        return {
+            "type": "regression",
+            "count": int(len(yv)),
+            "min": float(np.nanmin(yv.values)) if len(yv) else None,
+            "max": float(np.nanmax(yv.values)) if len(yv) else None,
+            "mean": float(np.nanmean(yv.values)) if len(yv) else None,
+            "std": float(np.nanstd(yv.values)) if len(yv) else None,
+        }
+
+    ys = y.astype(str).fillna("NA")
+    vc = ys.value_counts().head(20)
+    return {
+        "type": "classification",
+        "count": int(len(ys)),
+        "classes_top": vc.index.tolist(),
+        "counts_top": vc.values.astype(int).tolist(),
+    }
+
+
+# ============================================================
 # Pages
 # ============================================================
 def page_home():
@@ -962,16 +1188,20 @@ def page_home():
         unsafe_allow_html=True,
     )
 
-    c1, c2 = st.columns([1, 1])
+    st.write("")
+    c1, c2 = st.columns(2, gap="large")
     with c1:
-        st.markdown('<div class="btn-grad">', unsafe_allow_html=True)
+        st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
         st.button("➕ New Project", use_container_width=True, on_click=lambda: (new_project(), request_nav("data")))
         st.markdown("</div>", unsafe_allow_html=True)
-
     with c2:
+        st.markdown('<div class="btn-row">', unsafe_allow_html=True)
         if st.button("📂 Open Current Project", use_container_width=True):
             if ensure_current_project() is None:
                 st.warning("No current project found. Create one first.")
+            else:
+                request_nav("data")
+        st.markdown("</div>", unsafe_allow_html=True)
 
     st.write("")
     st.subheader("Features")
@@ -982,10 +1212,13 @@ def page_home():
         ("🏋️", "Train", "Real training + saved model artifacts"),
         ("✅", "Evaluate", "Real metrics + labeled confusion matrix (ANN classification)"),
         ("🔮", "Predict", "ANN manual/batch • LSTM future forecast (features held constant if unknown)"),
+        ("📊", "Visualize", "Training curves + residuals + actual vs predicted"),
+        ("💾", "Save/Load", "Download & restore project JSON"),
+        ("⚡", "Performance", "Lazy-loaded TF/sklearn/matplotlib for faster startup"),
     ]
-    cols = st.columns(3)
+    cols = st.columns(4)
     for i, (ico, title, desc) in enumerate(feats):
-        with cols[i % 3]:
+        with cols[i % 4]:
             st.markdown(
                 f"""
                 <div class="ns-card" style="min-height: 140px;">
@@ -1037,14 +1270,19 @@ def page_data():
 
     if uploaded is not None:
         name = uploaded.name.lower()
-        if name.endswith(".csv"):
-            df = pd.read_csv(uploaded)
-            file_type = "csv"
-        else:
-            xls = pd.ExcelFile(uploaded)
-            sheet_name = st.selectbox("Select sheet", xls.sheet_names, index=0)
-            df = pd.read_excel(uploaded, sheet_name=sheet_name)
-            file_type = "excel"
+        try:
+            if name.endswith(".csv"):
+                df = pd.read_csv(uploaded)
+                file_type = "csv"
+            else:
+                xls = pd.ExcelFile(uploaded)
+                sheet_name = st.selectbox("Select sheet", xls.sheet_names, index=0)
+                df = pd.read_excel(uploaded, sheet_name=sheet_name)
+                file_type = "excel"
+        except Exception as e:
+            st.error(f"Could not read file: {e}")
+            st.markdown("</div>", unsafe_allow_html=True)
+            return
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1060,9 +1298,9 @@ def page_data():
         with open(dataset_path, "wb") as f:
             f.write(uploaded.getbuffer())
 
+        # Clear only dataset cache (safe)
         try:
             cached_load_dataset.clear()
-            cached_feature_meta.clear()
         except Exception:
             pass
 
@@ -1083,8 +1321,8 @@ def page_data():
         p["history"] = {"loss": [], "val_loss": []}
         p.setdefault("viz_cache", {})
         p["viz_cache"].pop("ann_regression", None)
+        p["target_profile"] = {}
 
-        # reset selections
         p["columns"]["target"] = None
         p["columns"]["time"] = None
         p["columns"]["features"] = []
@@ -1132,6 +1370,7 @@ def page_data():
         p["columns"]["time"] = None if time_col == "(None)" else time_col
         p["columns"]["features"] = [c for c in features if c != target]
 
+        # Feature meta only when features selected (cached)
         try:
             ds_path = p.get("dataset", {}).get("path")
             ds_type = p.get("dataset", {}).get("file_type")
@@ -1150,16 +1389,42 @@ def page_data():
 
         st.write("")
         st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-        st.write("### Data Preview (first 10 rows)")
-        preview = p.get("raw_preview", [])
-        if preview:
-            st.dataframe(pd.DataFrame(preview), use_container_width=True, height=320)
+        st.write("### Data Preview")
+
+        if "data_preview_rows" not in st.session_state:
+            st.session_state["data_preview_rows"] = 10
+
+        n_rows = st.number_input(
+            "Number of uploaded rows shown",
+            min_value=1,
+            step=1,
+            value=int(st.session_state["data_preview_rows"]),
+            key="data_preview_rows",
+        )
+
+        # Load only here (not on every page)
+        try:
+            df_full = load_project_dataset(p)
+            st.dataframe(df_full.head(int(n_rows)), use_container_width=True, height=360)
+        except Exception:
+            preview = p.get("raw_preview", [])
+            if preview:
+                st.dataframe(pd.DataFrame(preview).head(int(n_rows)), use_container_width=True, height=360)
+            else:
+                st.info("Upload a dataset to preview rows.")
+
         st.markdown("</div>", unsafe_allow_html=True)
 
         st.write("")
-        st.markdown('<div class="btn-grad">', unsafe_allow_html=True)
-        st.button("Continue to Preprocessing ➜", use_container_width=True, on_click=request_nav, args=("preprocess",))
-        st.markdown("</div>", unsafe_allow_html=True)
+        c1, c2 = st.columns(2, gap="large")
+        with c1:
+            st.markdown('<div class="btn-row">', unsafe_allow_html=True)
+            st.button("⬅ Back to Home", use_container_width=True, on_click=request_nav, args=("home",))
+            st.markdown("</div>", unsafe_allow_html=True)
+        with c2:
+            st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
+            st.button("Continue to Preprocess ➜", use_container_width=True, on_click=request_nav, args=("preprocess",))
+            st.markdown("</div>", unsafe_allow_html=True)
     else:
         st.info("Upload a CSV/Excel to enable column selection and preview.")
 
@@ -1207,17 +1472,19 @@ def page_preprocess():
     st.write("### LSTM / Time Series Settings")
     p["preprocess"]["lookback"] = st.number_input("Lookback window", value=int(p["preprocess"].get("lookback", 20)), min_value=1, step=1)
     p["preprocess"]["horizon"] = st.number_input("Forecast horizon (steps ahead)", value=int(p["preprocess"].get("horizon", 1)), min_value=1, step=1)
-    st.caption("Multivariate LSTM will use: past lookback rows of (features + target) to predict target at horizon.")
+    st.caption("Multivariate LSTM uses past lookback rows of (features + target) to predict target at horizon.")
     st.markdown("</div>", unsafe_allow_html=True)
 
     upsert_project(p)
 
     st.write("")
-    c1, c2 = st.columns(2)
+    c1, c2 = st.columns(2, gap="large")
     with c1:
+        st.markdown('<div class="btn-row">', unsafe_allow_html=True)
         st.button("⬅ Back to Data", use_container_width=True, on_click=request_nav, args=("data",))
+        st.markdown("</div>", unsafe_allow_html=True)
     with c2:
-        st.markdown('<div class="btn-grad">', unsafe_allow_html=True)
+        st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
         st.button(
             "Continue to Model Configuration ➜",
             use_container_width=True,
@@ -1232,7 +1499,7 @@ def page_model():
         st.warning("No current project.")
         return
 
-    st.title("Model Architecture")
+    st.title("Model")
     status_bar(p.get("status", "data_loaded"))
 
     st.markdown('<div class="ns-card">', unsafe_allow_html=True)
@@ -1286,13 +1553,19 @@ def page_model():
     upsert_project(p)
 
     st.write("")
-    st.markdown('<div class="btn-grad">', unsafe_allow_html=True)
-    st.button(
-        "Continue to Training ➜",
-        use_container_width=True,
-        on_click=lambda: (p.__setitem__("status", "configured"), upsert_project(p), request_nav("train")),
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        st.markdown('<div class="btn-row">', unsafe_allow_html=True)
+        st.button("⬅ Back to Preprocess", use_container_width=True, on_click=request_nav, args=("preprocess",))
+        st.markdown("</div>", unsafe_allow_html=True)
+    with c2:
+        st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
+        st.button(
+            "Continue to Training ➜",
+            use_container_width=True,
+            on_click=lambda: (p.__setitem__("status", "configured"), upsert_project(p), request_nav("train")),
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def page_train():
@@ -1301,7 +1574,7 @@ def page_train():
         st.warning("No current project.")
         return
 
-    st.title("Train Model")
+    st.title("Train")
     status_bar(p.get("status", "data_loaded"))
 
     ds = p.get("dataset", {})
@@ -1337,7 +1610,7 @@ def page_train():
     st.write("")
     st.markdown('<div class="ns-card">', unsafe_allow_html=True)
     st.write("### Training Controls")
-    st.markdown('<div class="btn-emerald">', unsafe_allow_html=True)
+    st.markdown('<div class="btn-row btn-emerald">', unsafe_allow_html=True)
     run = st.button("▶ Start Training", use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1381,27 +1654,32 @@ def page_train():
             ui_task = p.get("task_type", "classification")
             task_choice = "auto" if ui_task == "auto-detect" else ui_task
 
-            with st.spinner("Training model (real ANN)..."):
-                model, preprocessor, label_encoder, results, history = train_ann_from_df(
-                    df=df,
-                    target_col=target,
-                    feature_cols=feature_cols,
-                    task_choice=task_choice,
-                    test_size=test_size,
-                    epochs=epochs,
-                    batch_size=batch_size,
-                    lr=lr,
-                    early_stop=early_stop,
-                    patience=patience,
-                    seed=seed,
-                    ann_config=p.get("ann_config", {}),
-                )
+            try:
+                with st.spinner("Training model (real ANN)..."):
+                    model, preprocessor, label_encoder, results, history = train_ann_from_df(
+                        df=df,
+                        target_col=target,
+                        feature_cols=feature_cols,
+                        task_choice=task_choice,
+                        test_size=test_size,
+                        epochs=epochs,
+                        batch_size=batch_size,
+                        lr=lr,
+                        early_stop=early_stop,
+                        patience=patience,
+                        seed=seed,
+                        ann_config=p.get("ann_config", {}),
+                    )
+            except Exception as e:
+                st.error(f"ANN training could not start: {e}")
+                return
 
-            # -----------------------------
-            # Save residual plot data for ANN regression (so Visualize can plot it)
-            # -----------------------------
+            # Save residual plot data for ANN regression
             try:
                 if results.get("task") == "regression":
+                    sk = _get_sklearn()
+                    train_test_split = sk["train_test_split"]
+
                     X_full = df[feature_cols].copy()
                     y_full = pd.to_numeric(df[target], errors="coerce").astype(float).values
 
@@ -1453,12 +1731,18 @@ def page_train():
                 "preprocessor_path": str(prep_path),
                 "label_encoder_path": str(le_path),
             }
+
+            try:
+                p["target_profile"] = build_target_profile(df, target)
+            except Exception:
+                p["target_profile"] = {}
+
             p["history"] = history
             p["evaluation_metrics"] = results
             p["status"] = "trained"
             upsert_project(p)
 
-            st.success("Training finished (ANN). You can now Evaluate / Predict / Visualize.")
+            st.success("Training finished (ANN). You can now Evaluate → Predict → Visualize.")
 
         else:
             if not feature_cols:
@@ -1484,6 +1768,13 @@ def page_train():
             with st.spinner("Training model (real MULTIVARIATE LSTM)..."):
                 model, pack, history, metrics, outputs = train_lstm_from_df(df, cfg)
 
+            if (metrics or {}).get("status") != "ok" or model is None or pack is None:
+                st.error((metrics or {}).get("message", "LSTM training could not start."))
+                warns = (metrics or {}).get("warnings", [])
+                if warns:
+                    st.warning("\n".join([f"• {w}" for w in warns]))
+                return
+
             model_path = MODELS_DIR / "lstm_model.keras"
             pack_path = MODELS_DIR / "lstm_pack.joblib"
             outputs_path = MODELS_DIR / "lstm_outputs.npz"
@@ -1506,17 +1797,31 @@ def page_train():
                 "outputs_path": str(outputs_path),
                 "lookback": used_lookback,
             }
+
+            try:
+                p["target_profile"] = build_target_profile(df, target)
+            except Exception:
+                p["target_profile"] = {}
+
             p["history"] = {"loss": history.get("loss", []), "val_loss": history.get("val_loss", [])}
             p["evaluation_metrics"] = metrics
             p["status"] = "trained"
             upsert_project(p)
 
-            st.success("Training finished (Multivariate LSTM). You can now Evaluate / Predict / Visualize.")
+            st.success("Training finished (Multivariate LSTM). You can now Evaluate → Predict → Visualize.")
+            if metrics.get("warnings"):
+                st.warning("\n".join([f"• {w}" for w in metrics["warnings"]]))
 
     st.write("")
-    st.markdown('<div class="btn-grad">', unsafe_allow_html=True)
-    st.button("⚡ Evaluate Model", use_container_width=True, on_click=request_nav, args=("evaluate",))
-    st.markdown("</div>", unsafe_allow_html=True)
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        st.markdown('<div class="btn-row">', unsafe_allow_html=True)
+        st.button("⬅ Back to Model", use_container_width=True, on_click=request_nav, args=("model",))
+        st.markdown("</div>", unsafe_allow_html=True)
+    with c2:
+        st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
+        st.button("Continue to Evaluate ➜", use_container_width=True, on_click=request_nav, args=("evaluate",))
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def page_evaluate():
@@ -1525,7 +1830,7 @@ def page_evaluate():
         st.warning("No current project.")
         return
 
-    st.title("Evaluate Model")
+    st.title("Evaluate")
     status_bar(p.get("status", "data_loaded"))
 
     if p.get("status") not in ["trained", "evaluated"]:
@@ -1580,9 +1885,15 @@ def page_evaluate():
     upsert_project(p)
 
     st.write("")
-    st.markdown('<div class="btn-grad">', unsafe_allow_html=True)
-    st.button("Make Predictions ➜", use_container_width=True, on_click=request_nav, args=("predict",))
-    st.markdown("</div>", unsafe_allow_html=True)
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        st.markdown('<div class="btn-row">', unsafe_allow_html=True)
+        st.button("⬅ Back to Train", use_container_width=True, on_click=request_nav, args=("train",))
+        st.markdown("</div>", unsafe_allow_html=True)
+    with c2:
+        st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
+        st.button("Continue to Predict ➜", use_container_width=True, on_click=request_nav, args=("predict",))
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def page_predict():
@@ -1617,6 +1928,7 @@ def page_predict():
             st.error(f"Failed to load trained model artifacts: {e}")
             return
 
+        target_name = (p.get("columns") or {}).get("target") or "target"
         task = (p.get("evaluation_metrics") or {}).get("task", "classification")
 
         tab1, tab2 = st.tabs(["Manual Input", "Upload File"])
@@ -1624,6 +1936,12 @@ def page_predict():
         with tab1:
             st.markdown('<div class="ns-card">', unsafe_allow_html=True)
             st.write("### Input Features")
+
+            st.caption(
+                f"**What will be predicted?** This model estimates **{target_name}** from the feature values you enter below. "
+                + ("**Classification:** predicts a label/class." if task == "classification"
+                   else "**Regression:** predicts a numeric value.")
+            )
 
             meta = p.get("feature_meta", {}) or {}
             vals: Dict[str, Any] = {}
@@ -1641,7 +1959,7 @@ def page_predict():
             st.markdown("</div>", unsafe_allow_html=True)
 
             st.write("")
-            st.markdown('<div class="btn-emerald">', unsafe_allow_html=True)
+            st.markdown('<div class="btn-row btn-emerald">', unsafe_allow_html=True)
             do = st.button("🔮 Predict", use_container_width=True)
             st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1649,14 +1967,38 @@ def page_predict():
                 row = pd.DataFrame([vals], columns=features)
                 pred, conf = predict_from_df(row, model, preprocessor, task=task, label_encoder=label_encoder)
 
-                st.markdown('<div class="ns-card" style="background: linear-gradient(90deg,#06b6d4,#6366f1); color:white;">', unsafe_allow_html=True)
+                st.write("")
+                st.markdown('<div class="ns-card">', unsafe_allow_html=True)
                 st.write("### Prediction Result")
+
+                a, b, c = st.columns([1.2, 1.0, 1.2], gap="large")
+                with a:
+                    st.caption("Target")
+                    st.markdown(f"**{target_name}**")
+                with b:
+                    st.caption("Output Type")
+                    st.markdown(f"**{'Classification' if task == 'classification' else 'Regression'}**")
+                with c:
+                    st.caption("Model")
+                    st.markdown("**ANN**")
+
+                st.write("")
+
                 if task == "classification":
-                    st.write(f"**Predicted Class:** {pred[0]}")
-                    if conf is not None:
-                        st.write(f"**Confidence:** {float(conf[0]) * 100:.1f}%")
+                    pred_label = str(pred[0])
+                    conf_pct = f"{float(conf[0]) * 100:.1f}%" if conf is not None else "—"
+
+                    c1, c2 = st.columns(2, gap="large")
+                    with c1:
+                        st.metric(label=f"Predicted {target_name}", value=pred_label)
+                    with c2:
+                        st.metric(label="Confidence", value=conf_pct)
+
+                    st.caption("Confidence is the model’s estimated certainty for the predicted label.")
                 else:
-                    st.write(f"**Predicted Value:** {float(pred[0]):.6f}")
+                    st.metric(label=f"Predicted {target_name}", value=f"{float(pred[0]):.6f}")
+                    st.caption("This numeric value is estimated by the trained model using your input features.")
+
                 st.markdown("</div>", unsafe_allow_html=True)
 
         with tab2:
@@ -1667,12 +2009,15 @@ def page_predict():
             df_up = None
 
             if up is not None:
-                if up.name.lower().endswith(".csv"):
-                    df_up = pd.read_csv(up)
-                else:
-                    xls = pd.ExcelFile(up)
-                    sheet = st.selectbox("Select sheet", xls.sheet_names, index=0, key="pred_sheet")
-                    df_up = pd.read_excel(up, sheet_name=sheet)
+                try:
+                    if up.name.lower().endswith(".csv"):
+                        df_up = pd.read_csv(up)
+                    else:
+                        xls = pd.ExcelFile(up)
+                        sheet = st.selectbox("Select sheet", xls.sheet_names, index=0, key="pred_sheet")
+                        df_up = pd.read_excel(up, sheet_name=sheet)
+                except Exception as e:
+                    st.error(f"Could not read uploaded prediction file: {e}")
 
             st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1681,7 +2026,7 @@ def page_predict():
                 if missing_cols:
                     st.error(f"Missing required columns: {missing_cols}")
                 else:
-                    st.markdown('<div class="btn-emerald">', unsafe_allow_html=True)
+                    st.markdown('<div class="btn-row btn-emerald">', unsafe_allow_html=True)
                     gen = st.button("Generate Predictions", use_container_width=True)
                     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1690,7 +2035,7 @@ def page_predict():
                         preds, conf = predict_from_df(X_feat, model, preprocessor, task=task, label_encoder=label_encoder)
 
                         out = df_up.copy()
-                        out["prediction"] = preds
+                        out[f"prediction__{target_name}"] = preds
                         if task == "classification" and conf is not None:
                             out["confidence"] = np.round(conf.astype(float), 6)
 
@@ -1711,40 +2056,306 @@ def page_predict():
             st.error(f"Failed to load LSTM artifacts: {e}")
             return
 
+        KEY_FC_STEPS = f"fc_steps__{p['id']}"
+        KEY_FC_SHOW = f"fc_show__{p['id']}"
+        KEY_FC_DF = f"fc_df__{p['id']}"
+
+        st.session_state.setdefault(KEY_FC_STEPS, 1)
+        st.session_state.setdefault(KEY_FC_SHOW, 1)
+
+        def _generate_forecast(n_steps: int) -> pd.DataFrame:
+            scaled_full = outputs["scaled_full"]
+            lookback = int(artifacts.get("lookback", int(outputs["lookback"][0]) if "lookback" in outputs else 10))
+            last_feat = outputs["last_feature_scaled"]
+            scaler_y = pack["scaler_y"]
+
+            future = forecast_future_multivariate(
+                model=model,
+                scaler_y=scaler_y,
+                scaled_full=scaled_full,
+                lookback=lookback,
+                n_steps=int(n_steps),
+                last_feature_scaled=last_feat,
+            )
+            return pd.DataFrame(future, columns=["forecast"])
+
         st.markdown('<div class="ns-card">', unsafe_allow_html=True)
         st.write("### Future Forecast (Multivariate LSTM)")
-        horizon_default = int(p.get("preprocess", {}).get("horizon", 1))
-        n_future = st.number_input("Steps to forecast", 1, 2000, int(horizon_default))
-        st.caption("If future feature values are unknown, we hold features constant at the last observed values.")
+        st.caption("If future feature values are unknown, the app holds features constant at the last observed values.")
+
+        st.number_input(
+            "Number of future steps to forecast",
+            min_value=1,
+            step=1,
+            key=KEY_FC_STEPS,
+        )
+
         st.markdown("</div>", unsafe_allow_html=True)
 
-        st.markdown('<div class="btn-emerald">', unsafe_allow_html=True)
+        st.markdown('<div class="btn-row btn-emerald">', unsafe_allow_html=True)
         do = st.button("🔮 Forecast", use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
         if do:
             try:
-                scaled_full = outputs["scaled_full"]
-                lookback = int(artifacts.get("lookback", int(outputs["lookback"][0]) if "lookback" in outputs else 10))
-                last_feat = outputs["last_feature_scaled"]
-                scaler_y = pack["scaler_y"]
-
-                future = forecast_future_multivariate(
-                    model=model,
-                    scaler_y=scaler_y,
-                    scaled_full=scaled_full,
-                    lookback=lookback,
-                    n_steps=int(n_future),
-                    last_feature_scaled=last_feat,
-                )
-                out_df = pd.DataFrame(future, columns=["forecast"])
-                st.success("Forecast generated.")
-                st.dataframe(out_df, use_container_width=True)
-
-                csv_bytes = out_df.to_csv(index=False).encode("utf-8")
-                st.download_button("Download Forecast CSV", data=csv_bytes, file_name="lstm_forecast.csv", mime="text/csv")
+                n_steps = int(st.session_state[KEY_FC_STEPS])
+                df_fc = _generate_forecast(n_steps)
+                if df_fc.empty:
+                    st.error("Forecast generated no results. Try increasing data or adjusting lookback/horizon.")
+                else:
+                    st.session_state[KEY_FC_DF] = df_fc
+                    st.session_state[KEY_FC_SHOW] = max(1, min(int(st.session_state[KEY_FC_SHOW]), int(len(df_fc))))
             except Exception as e:
                 st.error(f"Forecast error: {e}")
+
+        df_fc: Optional[pd.DataFrame] = st.session_state.get(KEY_FC_DF, None)
+
+        if df_fc is not None and not df_fc.empty:
+            target_name = (p.get("columns") or {}).get("target") or "target"
+
+            st.write("")
+            st.markdown('<div class="ns-card">', unsafe_allow_html=True)
+            st.write("### Forecast Result")
+
+            a, b, c = st.columns([1.2, 1.0, 1.2], gap="large")
+            with a:
+                st.caption("Target")
+                st.markdown(f"**{target_name}**")
+            with b:
+                st.caption("Steps Generated")
+                st.markdown(f"**{len(df_fc)}**")
+            with c:
+                st.caption("Model")
+                st.markdown("**LSTM (Time Series)**")
+
+            first_val = float(df_fc["forecast"].iloc[0])
+            st.metric(label=f"Forecasted {target_name} (next step)", value=f"{first_val:,.4f}")
+
+            st.write("")
+            st.number_input(
+                "Number of forecast steps shown",
+                min_value=1,
+                step=1,
+                key=KEY_FC_SHOW,
+            )
+
+            want_show = int(st.session_state[KEY_FC_SHOW])
+
+            if want_show > len(df_fc):
+                try:
+                    df_new = _generate_forecast(want_show)
+                    if not df_new.empty:
+                        st.session_state[KEY_FC_DF] = df_new
+                        df_fc = df_new
+                except Exception as e:
+                    st.warning(f"Could not auto-expand forecast: {e}")
+                    want_show = len(df_fc)
+
+            show_n = max(1, min(want_show, int(len(df_fc))))
+            preview_df = df_fc.head(show_n).copy()
+            preview_df.insert(0, "step", range(1, len(preview_df) + 1))
+
+            st.dataframe(preview_df, use_container_width=True, height=320)
+
+            csv_bytes = df_fc.to_csv(index=False).encode("utf-8")
+            st.download_button("Download Forecast CSV", data=csv_bytes, file_name="lstm_forecast.csv", mime="text/csv")
+
+            st.caption("These values are generated from the trained LSTM model based on your historical data.")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    st.write("")
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        st.markdown('<div class="btn-row">', unsafe_allow_html=True)
+        st.button("⬅ Back to Evaluate", use_container_width=True, on_click=request_nav, args=("evaluate",))
+        st.markdown("</div>", unsafe_allow_html=True)
+    with c2:
+        st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
+        st.button("Continue to Visualize ➜", use_container_width=True, on_click=request_nav, args=("visualize",))
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+def page_visualize():
+    p = ensure_current_project()
+    if p is None:
+        st.warning("No current project.")
+        return
+
+    st.title("Visualize")
+    status_bar(p.get("status", "data_loaded"))
+    plt = _get_plt()
+
+    st.write("")
+    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
+    st.write("### Target Preview")
+
+    ds = p.get("dataset", {})
+    target = (p.get("columns") or {}).get("target")
+    if ds.get("path") and target:
+        try:
+            df = load_project_dataset(p)
+            if target not in df.columns:
+                st.info("Target column not found in the dataset.")
+            else:
+                y = df[target].copy()
+                y_num = pd.to_numeric(y, errors="coerce")
+
+                if y_num.notna().sum() >= 5:
+                    y_plot = y_num.dropna().head(400)
+                    fig0 = plt.figure(figsize=(11, 4))
+                    plt.plot(range(len(y_plot)), y_plot.values)
+                    plt.title(f"Target Trend (first {len(y_plot)} points)")
+                    plt.xlabel("Index")
+                    plt.ylabel(target)
+                    plt.grid(True, alpha=0.25)
+                    st.pyplot(fig0, clear_figure=True)
+                    st.caption("Shows the beginning of the target series after numeric conversion.")
+                else:
+                    vc = y.astype(str).value_counts().head(20)
+                    fig0 = plt.figure(figsize=(11, 4))
+                    plt.bar(vc.index.astype(str), vc.values)
+                    plt.title("Target Category Counts (Top 20)")
+                    plt.xlabel("Class")
+                    plt.ylabel("Count")
+                    plt.xticks(rotation=35, ha="right")
+                    plt.grid(True, axis="y", alpha=0.25)
+                    st.pyplot(fig0, clear_figure=True)
+                    st.caption("Target is not numeric; showing class distribution.")
+        except Exception as e:
+            st.info(f"Preview plot unavailable: {e}")
+    else:
+        st.info("Upload data and choose a target column to see the target preview.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    loss = (p.get("history") or {}).get("loss", []) or []
+    val_loss = (p.get("history") or {}).get("val_loss", []) or []
+
+    st.write("")
+    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
+    st.write("### Training Curve (Loss)")
+    if loss:
+        fig = plt.figure(figsize=(11, 4))
+        x = range(1, len(loss) + 1)
+        plt.plot(x, loss, label="Train Loss", linewidth=2.0)
+        if val_loss:
+            xv = range(1, len(val_loss) + 1)
+            plt.plot(xv, val_loss, label="Validation Loss", linewidth=2.0)
+        plt.title("Loss vs Epoch")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss (lower is better)")
+        plt.grid(True, alpha=0.25)
+        plt.legend()
+        st.pyplot(fig, clear_figure=True)
+        st.caption("Lower loss generally means better fit. Validation loss helps detect overfitting.")
+    else:
+        st.info("No training history yet. Train the model first.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    viz = (p.get("viz_cache") or {}).get("ann_regression")
+    if viz:
+        try:
+            y_test = np.array(viz.get("y_test", []), dtype=float)
+            y_pred = np.array(viz.get("y_pred", []), dtype=float)
+            if len(y_test) and len(y_pred) and len(y_test) == len(y_pred):
+                residuals = y_test - y_pred
+
+                st.write("")
+                st.markdown('<div class="ns-card">', unsafe_allow_html=True)
+                st.write("### Residual Plot (ANN Regression)")
+                fig_r = plt.figure(figsize=(11, 4))
+                plt.scatter(y_pred, residuals, alpha=0.6)
+                plt.axhline(0, linestyle="--")
+                plt.title("Residuals vs Predicted")
+                plt.xlabel("Predicted")
+                plt.ylabel("Residual (Actual - Predicted)")
+                plt.grid(True, alpha=0.25)
+                st.pyplot(fig_r, clear_figure=True)
+                st.caption("Good model: residuals spread randomly around 0 without a visible pattern.")
+                st.markdown("</div>", unsafe_allow_html=True)
+        except Exception:
+            pass
+
+    artifacts = p.get("artifacts") or {}
+    if artifacts.get("kind") == "lstm":
+        st.write("")
+        st.markdown('<div class="ns-card">', unsafe_allow_html=True)
+        st.write("### LSTM: Actual vs Predicted")
+        try:
+            _, _, outputs = cached_load_lstm_artifacts(
+                artifacts["model_path"],
+                artifacts["pack_path"],
+                artifacts["outputs_path"],
+            )
+
+            y_train_actual = outputs["y_train_actual"].reshape(-1)
+            y_test_actual = outputs["y_test_actual"].reshape(-1)
+            train_pred_actual = outputs["train_pred_actual"].reshape(-1)
+            test_pred_actual = outputs["test_pred_actual"].reshape(-1)
+
+            lookback = int(artifacts.get("lookback", int(outputs["lookback"][0]) if "lookback" in outputs else 10))
+
+            fig2 = plt.figure(figsize=(11, 4.5))
+            train_idx = range(lookback, lookback + len(y_train_actual))
+            test_idx = range(lookback + len(y_train_actual), lookback + len(y_train_actual) + len(y_test_actual))
+
+            plt.plot(train_idx, y_train_actual, label="Actual (Train)", alpha=0.65, linewidth=1.8)
+            plt.plot(train_idx, train_pred_actual, label="Predicted (Train)", alpha=0.65, linestyle="--", linewidth=1.8)
+            plt.plot(test_idx, y_test_actual, label="Actual (Test)", alpha=0.85, linewidth=2.0)
+            plt.plot(test_idx, test_pred_actual, label="Predicted (Test)", alpha=0.85, linestyle="--", linewidth=2.0)
+            plt.axvline(x=lookback + len(y_train_actual), linestyle=":", label="Train/Test Split")
+
+            plt.title("LSTM Forecast Performance")
+            plt.xlabel("Time Index")
+            plt.ylabel("Target Value")
+            plt.grid(True, alpha=0.25)
+            plt.legend()
+            st.pyplot(fig2, clear_figure=True)
+        except Exception as e:
+            st.info(f"LSTM plot not available: {e}")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        try:
+            y_test_l = outputs["y_test_actual"].reshape(-1)
+            y_pred_l = outputs["test_pred_actual"].reshape(-1)
+            if len(y_test_l) and len(y_pred_l) and len(y_test_l) == len(y_pred_l):
+                residuals_l = y_test_l - y_pred_l
+
+                st.write("")
+                st.markdown('<div class="ns-card">', unsafe_allow_html=True)
+                st.write("### Residual Plot (LSTM Test)")
+                fig_rl = plt.figure(figsize=(11, 4))
+                plt.scatter(y_pred_l, residuals_l, alpha=0.6)
+                plt.axhline(0, linestyle="--")
+                plt.title("Residuals vs Predicted (Test)")
+                plt.xlabel("Predicted")
+                plt.ylabel("Residual (Actual - Predicted)")
+                plt.grid(True, alpha=0.25)
+                st.pyplot(fig_rl, clear_figure=True)
+                st.caption("Residuals computed from saved LSTM test predictions.")
+                st.markdown("</div>", unsafe_allow_html=True)
+        except Exception:
+            pass
+
+    st.write("")
+    st.markdown('<div class="ns-card" style="border-color:#a7f3d0; background:#ecfdf5;">', unsafe_allow_html=True)
+    st.write("### Evaluation Metrics")
+    m = p.get("evaluation_metrics")
+    if not m:
+        st.caption("No evaluation metrics yet.")
+    else:
+        st.json(m)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.write("")
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        st.markdown('<div class="btn-row">', unsafe_allow_html=True)
+        st.button("⬅ Back to Predict", use_container_width=True, on_click=request_nav, args=("predict",))
+        st.markdown("</div>", unsafe_allow_html=True)
+    with c2:
+        st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
+        st.button("Continue to Save / Load ➜", use_container_width=True, on_click=request_nav, args=("save",))
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def page_save_load():
@@ -1768,7 +2379,7 @@ def page_save_load():
     st.markdown('<div class="ns-card" style="border-color:#a7f3d0;">', unsafe_allow_html=True)
     st.write("### Save Project Package (JSON)")
     st.caption("Saves UI settings + history + paths. (Model files are stored under .neural_studio/models/)")
-    json_bytes = json.dumps(p, indent=2).encode("utf-8")
+    json_bytes = json.dumps(_json_safe(p), indent=2, ensure_ascii=False).encode("utf-8")
     st.download_button("💾 Download JSON", data=json_bytes, file_name="neural_studio_project.json", mime="application/json")
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1788,131 +2399,21 @@ def page_save_load():
             loaded.setdefault("ann_config", {"hidden_layers": 3, "neurons": [256, 128, 64], "activation": "ReLU", "output_activation": "Auto"})
             loaded.setdefault("lstm_config", {"units": 64, "layers": 2, "dropout": 0.2, "bidirectional": False})
             loaded.setdefault("viz_cache", {})
+            loaded.setdefault("target_profile", {})
             upsert_project(loaded)
             request_nav("data")
         except Exception as e:
             st.error(f"Failed to load JSON: {e}")
     st.markdown("</div>", unsafe_allow_html=True)
 
-
-def page_visualize():
-    p = ensure_current_project()
-    if p is None:
-        st.warning("No current project.")
-        return
-
-    st.title("Visualize")
-    status_bar(p.get("status", "data_loaded"))
-
-    loss = p.get("history", {}).get("loss", [])
-    val_loss = p.get("history", {}).get("val_loss", [])
-
-    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-    st.write("### Training Loss Chart")
-    if loss:
-        fig = plt.figure()
-        plt.plot(range(1, len(loss) + 1), loss, label="Training Loss")
-        if val_loss:
-            plt.plot(range(1, len(val_loss) + 1), val_loss, label="Validation Loss")
-        plt.xlabel("Epoch (training rounds)")
-        plt.ylabel("Loss (prediction error)")
-        plt.legend()
-        st.pyplot(fig, clear_figure=True)
-        st.caption("X-axis: Epoch. Y-axis: Loss. Lower is better.")
-    else:
-        st.info("No training history yet. Train the model first.")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # -----------------------------
-    # Residual Plot (ANN Regression) - restored ✅
-    # -----------------------------
-    viz = (p.get("viz_cache") or {}).get("ann_regression")
-    if viz:
-        try:
-            y_test = np.array(viz["y_test"], dtype=float)
-            y_pred = np.array(viz["y_pred"], dtype=float)
-            residuals = y_test - y_pred
-
-            st.write("")
-            st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-            st.write("### Residual Plot (ANN Regression)")
-            fig_r = plt.figure()
-            plt.scatter(y_pred, residuals, alpha=0.6)
-            plt.axhline(0)
-            plt.xlabel("Predicted")
-            plt.ylabel("Residual (actual - predicted)")
-            st.pyplot(fig_r, clear_figure=True)
-            st.caption("Good model: residuals scattered around 0 without a clear pattern.")
-            st.markdown("</div>", unsafe_allow_html=True)
-        except Exception:
-            pass
-
-    artifacts = p.get("artifacts") or {}
-    if artifacts.get("kind") == "lstm":
-        st.write("")
-        st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-        st.write("### LSTM Predictions vs Actual")
-        try:
-            model, pack, outputs = cached_load_lstm_artifacts(
-                artifacts["model_path"],
-                artifacts["pack_path"],
-                artifacts["outputs_path"],
-            )
-
-            y_train_actual = outputs["y_train_actual"]
-            y_test_actual = outputs["y_test_actual"]
-            train_pred_actual = outputs["train_pred_actual"]
-            test_pred_actual = outputs["test_pred_actual"]
-            lookback = int(artifacts.get("lookback", int(outputs["lookback"][0]) if "lookback" in outputs else 10))
-
-            fig2 = plt.figure(figsize=(12, 6))
-            train_idx = range(lookback, lookback + len(y_train_actual))
-            test_idx = range(lookback + len(y_train_actual), lookback + len(y_train_actual) + len(y_test_actual))
-
-            plt.plot(train_idx, y_train_actual, label="Actual (Train)", alpha=0.6)
-            plt.plot(train_idx, train_pred_actual, label="Predicted (Train)", alpha=0.6, linestyle="--")
-            plt.plot(test_idx, y_test_actual, label="Actual (Test)", alpha=0.7)
-            plt.plot(test_idx, test_pred_actual, label="Predicted (Test)", alpha=0.8, linestyle="--")
-            plt.axvline(x=lookback + len(y_train_actual), linestyle=":", label="Train/Test Split")
-            plt.legend()
-            st.pyplot(fig2, clear_figure=True)
-        except Exception as e:
-            st.info(f"LSTM plot not available: {e}")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        # LSTM residual plot (bonus)
-        try:
-            y_test_l = outputs["y_test_actual"].reshape(-1)
-            y_pred_l = outputs["test_pred_actual"].reshape(-1)
-            residuals_l = y_test_l - y_pred_l
-
-            st.write("")
-            st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-            st.write("### Residual Plot (LSTM Test)")
-            fig_rl = plt.figure()
-            plt.scatter(y_pred_l, residuals_l, alpha=0.6)
-            plt.axhline(0)
-            plt.xlabel("Predicted")
-            plt.ylabel("Residual (actual - predicted)")
-            st.pyplot(fig_rl, clear_figure=True)
-            st.caption("Based on the saved LSTM test predictions.")
-            st.markdown("</div>", unsafe_allow_html=True)
-        except Exception:
-            pass
-
     st.write("")
-    st.markdown('<div class="ns-card" style="border-color:#a7f3d0; background:#ecfdf5;">', unsafe_allow_html=True)
-    st.write("### Evaluation Metrics")
-    m = p.get("evaluation_metrics")
-    if not m:
-        st.caption("No evaluation metrics yet.")
-    else:
-        st.json(m)
+    st.markdown('<div class="btn-row">', unsafe_allow_html=True)
+    st.button("⬅ Back to Visualize", use_container_width=True, on_click=request_nav, args=("visualize",))
     st.markdown("</div>", unsafe_allow_html=True)
 
 
 # ============================================================
-# Routing
+# Routing (✅ requested order)
 # ============================================================
 PAGES = {
     "home": ("Home", page_home),
@@ -1922,8 +2423,8 @@ PAGES = {
     "train": ("Train", page_train),
     "evaluate": ("Evaluate", page_evaluate),
     "predict": ("Predict", page_predict),
-    "save": ("Save/Load", page_save_load),
     "visualize": ("Visualize", page_visualize),
+    "save": ("Save/Load", page_save_load),
 }
 
 
@@ -1931,7 +2432,6 @@ def main():
     st.set_page_config(page_title="Neural Studio", layout="wide")
     inject_css()
 
-    # Apply pending navigation at the start of each run (fixes double-click)
     apply_pending_nav()
 
     with st.sidebar:
@@ -1971,7 +2471,6 @@ def main():
                 CURRENT_FILE.unlink()
             request_nav("home")
 
-    # Apply nav requests from sidebar/buttons
     apply_pending_nav()
 
     active_key = st.query_params.get("page", "home")
