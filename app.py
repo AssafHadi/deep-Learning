@@ -1,10 +1,3 @@
-# UI_test.py (Single-file: UI + ANN backend + MULTIVARIATE LSTM backend)
-# ✅ SAFE LSTM + PROFESSIONAL VISUALIZE
-# ✅ SPEED UPDATE: Lazy import sklearn + matplotlib + tensorflow (faster startup / faster page switching)
-# ✅ FIX: Correct flow order (Home → Data → Model → Preprocess → Train → Evaluate → Predict → Visualize → Save/Load)
-# ✅ FIX: Hide ANN/LSTM settings when not relevant (no cross-settings confusion)
-# ✅ FIX: No "double click" when switching Model Type / Task (on_change + st.rerun)
-
 from __future__ import annotations
 
 import json
@@ -2666,3 +2659,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
