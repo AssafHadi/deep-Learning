@@ -1,6 +1,9 @@
 # UI_test.py (Single-file: UI + ANN backend + MULTIVARIATE LSTM backend)
 # ✅ SAFE LSTM + PROFESSIONAL VISUALIZE
 # ✅ SPEED UPDATE: Lazy import sklearn + matplotlib + tensorflow (faster startup / faster page switching)
+# ✅ FIX: Correct flow order (Home → Data → Model → Preprocess → Train → Evaluate → Predict → Visualize → Save/Load)
+# ✅ FIX: Hide ANN/LSTM settings when not relevant (no cross-settings confusion)
+# ✅ FIX: No "double click" when switching Model Type / Task (on_change + st.rerun)
 
 from __future__ import annotations
 
@@ -141,7 +144,7 @@ def _clamp_int(x: Any, lo: int, hi: int, default: int) -> int:
 
 
 # ============================================================
-# Navigation (Fixes the “double click” issue)
+# Navigation (Fixes the “double click” issue for page transitions)
 # ============================================================
 def request_nav(page: str) -> None:
     st.session_state["_nav_to"] = page
@@ -612,7 +615,7 @@ def make_sequences_multivariate(arr: np.ndarray, lookback: int, horizon: int) ->
     X, y = [], []
     target_idx = arr.shape[1] - 1
     for i in range(lookback, len(arr) - horizon + 1):
-        X.append(arr[i - lookback : i, :])
+        X.append(arr[i - lookback: i, :])
         y.append(arr[i + horizon - 1, target_idx])
 
     return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
@@ -967,11 +970,12 @@ def inject_css():
 
 
 def status_bar(current: str, processing: bool = False):
-    steps = ["data_loaded", "preprocessed", "configured", "trained", "evaluated"]
+    # Updated order to match flow: Data → Model → Preprocess → Train → Evaluate
+    steps = ["data_loaded", "configured", "preprocessed", "trained", "evaluated"]
     labels = {
         "data_loaded": "Data Loaded",
+        "configured": "Model Selected",
         "preprocessed": "Preprocessed",
-        "configured": "Model Configured",
         "trained": "Trained",
         "evaluated": "Evaluated",
     }
@@ -1006,11 +1010,12 @@ def status_bar(current: str, processing: bool = False):
 
 
 def bottom_nav(active: str):
+    # Updated order: Home → Data → Model → Preprocess → Train → Evaluate → Predict → Visualize → Save
     items = [
         ("home", "Home"),
         ("data", "Data"),
-        ("preprocess", "Preprocess"),
         ("model", "Model"),
+        ("preprocess", "Preprocess"),
         ("train", "Train"),
         ("evaluate", "Evaluate"),
         ("predict", "Predict"),
@@ -1037,7 +1042,7 @@ def new_project() -> Dict[str, Any]:
     p = {
         "id": str(uuid.uuid4()),
         "name": f"Project {time.strftime('%Y-%m-%d')}",
-        "task_type": "classification",
+        "task_type": "auto-detect",
         "model_type": "ann",
         "status": "data_loaded",
         "dataset": {"filename": "—", "rows": 0, "cols": 0, "missing": 0, "path": None, "file_type": None, "sheet": None},
@@ -1207,11 +1212,11 @@ def page_home():
     st.subheader("Features")
     feats = [
         ("📤", "Upload Data", "CSV/Excel upload with preview & column selection"),
-        ("🧹", "Preprocess", "Split settings are used in training"),
-        ("🧠", "Design Model", "ANN + Multivariate LSTM configuration"),
+        ("🧠", "Choose Model", "ANN for tabular • Multivariate LSTM for time series"),
+        ("🧹", "Preprocess", "Split settings used in training"),
         ("🏋️", "Train", "Real training + saved model artifacts"),
-        ("✅", "Evaluate", "Real metrics + labeled confusion matrix (ANN classification)"),
-        ("🔮", "Predict", "ANN manual/batch • LSTM future forecast (features held constant if unknown)"),
+        ("✅", "Evaluate", "Metrics + labeled confusion matrix (ANN classification)"),
+        ("🔮", "Predict", "ANN manual/batch • LSTM future forecast"),
         ("📊", "Visualize", "Training curves + residuals + actual vs predicted"),
         ("💾", "Save/Load", "Download & restore project JSON"),
         ("⚡", "Performance", "Lazy-loaded TF/sklearn/matplotlib for faster startup"),
@@ -1298,7 +1303,6 @@ def page_data():
         with open(dataset_path, "wb") as f:
             f.write(uploaded.getbuffer())
 
-        # Clear only dataset cache (safe)
         try:
             cached_load_dataset.clear()
         except Exception:
@@ -1370,7 +1374,6 @@ def page_data():
         p["columns"]["time"] = None if time_col == "(None)" else time_col
         p["columns"]["features"] = [c for c in features if c != target]
 
-        # Feature meta only when features selected (cached)
         try:
             ds_path = p.get("dataset", {}).get("path")
             ds_type = p.get("dataset", {}).get("file_type")
@@ -1402,7 +1405,6 @@ def page_data():
             key="data_preview_rows",
         )
 
-        # Load only here (not on every page)
         try:
             df_full = load_project_dataset(p)
             st.dataframe(df_full.head(int(n_rows)), use_container_width=True, height=360)
@@ -1423,10 +1425,213 @@ def page_data():
             st.markdown("</div>", unsafe_allow_html=True)
         with c2:
             st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
-            st.button("Continue to Preprocess ➜", use_container_width=True, on_click=request_nav, args=("preprocess",))
+            st.button("Continue to Model ➜", use_container_width=True, on_click=request_nav, args=("model",))
             st.markdown("</div>", unsafe_allow_html=True)
     else:
         st.info("Upload a CSV/Excel to enable column selection and preview.")
+
+
+def page_model():
+    p = ensure_current_project()
+    if p is None:
+        st.warning("No current project.")
+        return
+
+    st.title("Model")
+    status_bar(p.get("status", "data_loaded"))
+
+    # --- Callbacks to remove "double click" feeling ---
+    def _apply_model_change():
+        p2 = ensure_current_project()
+        if not p2:
+            return
+        key = f"model_type__{p2['id']}"
+        new_model = st.session_state.get(key, "ann")
+        p2["model_type"] = new_model
+
+        # Force LSTM to regression; hide Task UI for LSTM (set here)
+        if new_model == "lstm":
+            p2["task_type"] = "regression"
+
+        # Reset outputs to prevent mismatch between old artifacts and new choice
+        p2["evaluation_metrics"] = None
+        p2["artifacts"] = None
+        p2["history"] = {"loss": [], "val_loss": []}
+        p2.setdefault("viz_cache", {})
+        p2["viz_cache"].pop("ann_regression", None)
+
+        # Mark configured
+        p2["status"] = "configured"
+        upsert_project(p2)
+        st.rerun()
+
+    def _apply_task_change():
+        p2 = ensure_current_project()
+        if not p2:
+            return
+        key = f"task_type__{p2['id']}"
+        new_task = st.session_state.get(key, "auto-detect")
+        p2["task_type"] = new_task
+
+        # Reset outputs when task changes
+        p2["evaluation_metrics"] = None
+        p2["artifacts"] = None
+        p2["history"] = {"loss": [], "val_loss": []}
+        p2.setdefault("viz_cache", {})
+        p2["viz_cache"].pop("ann_regression", None)
+
+        p2["status"] = "configured"
+        upsert_project(p2)
+        st.rerun()
+
+    # --- Model Type (better UX, no cross-settings) ---
+    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
+    st.write("### Model Type")
+
+    default_model = p.get("model_type", "ann")
+    st.session_state.setdefault(f"model_type__{p['id']}", default_model)
+
+    st.radio(
+        "Choose",
+        ["ann", "lstm"],
+        index=0 if st.session_state[f"model_type__{p['id']}"] == "ann" else 1,
+        horizontal=True,
+        key=f"model_type__{p['id']}",
+        on_change=_apply_model_change,
+    )
+
+    # Always reflect the session state immediately
+    p["model_type"] = st.session_state[f"model_type__{p['id']}"]
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # --- Task Type: ONLY for ANN ---
+    st.write("")
+    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
+    st.write("### Task Type")
+
+    if p["model_type"] == "ann":
+        options = ["auto-detect", "classification", "regression"]
+        current = p.get("task_type", "auto-detect")
+        if current not in options:
+            current = "auto-detect"
+
+        st.session_state.setdefault(f"task_type__{p['id']}", current)
+
+        st.selectbox(
+            "Task",
+            options,
+            index=_safe_index(options, st.session_state[f"task_type__{p['id']}"], 0),
+            key=f"task_type__{p['id']}",
+            on_change=_apply_task_change,
+        )
+        p["task_type"] = st.session_state[f"task_type__{p['id']}"]
+        st.caption("ANN can do classification or regression (or auto-detect).")
+    else:
+        # LSTM: hide selector and force regression
+        p["task_type"] = "regression"
+        st.markdown('<span class="badge good">Fixed: Regression (Forecasting)</span>', unsafe_allow_html=True)
+        st.caption("LSTM is used for time-series forecasting, so the task is regression.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # --- Model-specific configuration panels ---
+    st.write("")
+    if p["model_type"] == "ann":
+        st.markdown('<div class="ns-card" style="background:#faf5ff; border-color:#ddd6fe;">', unsafe_allow_html=True)
+        st.write("### ANN Configuration (Applied for real ✅)")
+        p.setdefault("ann_config", {})
+        p["ann_config"]["hidden_layers"] = st.number_input(
+            "Hidden layers",
+            min_value=1,
+            max_value=12,
+            value=int(p["ann_config"].get("hidden_layers", 3)),
+            key=f"ann_hl__{p['id']}",
+        )
+        hl = int(p["ann_config"]["hidden_layers"])
+        neurons = p["ann_config"].get("neurons", [256, 128, 64])
+        if not isinstance(neurons, list):
+            neurons = [256, 128, 64]
+        neurons = (neurons + [64] * hl)[:hl]
+        new_neurons = []
+        for i in range(hl):
+            new_neurons.append(
+                int(
+                    st.number_input(
+                        f"Neurons in layer {i + 1}",
+                        min_value=1,
+                        max_value=2048,
+                        value=int(neurons[i]),
+                        key=f"ann_n_{i}__{p['id']}",
+                    )
+                )
+            )
+        p["ann_config"]["neurons"] = new_neurons
+        p["ann_config"]["activation"] = st.selectbox(
+            "Activation",
+            ["ReLU", "Tanh", "Sigmoid"],
+            index=_safe_index(["ReLU", "Tanh", "Sigmoid"], p["ann_config"].get("activation", "ReLU"), 0),
+            key=f"ann_act__{p['id']}",
+        )
+        p["ann_config"]["output_activation"] = st.selectbox(
+            "Output activation",
+            ["Auto", "Linear", "Sigmoid", "Softmax"],
+            index=_safe_index(["Auto", "Linear", "Sigmoid", "Softmax"], p["ann_config"].get("output_activation", "Auto"), 0),
+            key=f"ann_outact__{p['id']}",
+        )
+        st.caption("These settings are used during ANN training.")
+        st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="ns-card" style="background:#ecfeff; border-color:#a5f3fc;">', unsafe_allow_html=True)
+        st.write("### LSTM Configuration (Multivariate ✅)")
+        p.setdefault("lstm_config", {})
+        p["lstm_config"]["units"] = st.number_input(
+            "LSTM units",
+            min_value=1,
+            max_value=2048,
+            value=int(p["lstm_config"].get("units", 64)),
+            key=f"lstm_units__{p['id']}",
+        )
+        p["lstm_config"]["layers"] = st.number_input(
+            "Number of LSTM layers (stored)",
+            min_value=1,
+            max_value=6,
+            value=int(p["lstm_config"].get("layers", 2)),
+            key=f"lstm_layers__{p['id']}",
+        )
+        p["lstm_config"]["dropout"] = st.slider(
+            "Dropout rate",
+            0.0,
+            0.8,
+            float(p["lstm_config"].get("dropout", 0.2)),
+            key=f"lstm_do__{p['id']}",
+        )
+        p["lstm_config"]["bidirectional"] = st.checkbox(
+            "Bidirectional (stored)",
+            value=bool(p["lstm_config"].get("bidirectional", False)),
+            key=f"lstm_bi__{p['id']}",
+        )
+        st.caption("This LSTM uses selected FEATURES + past TARGET to predict future TARGET.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # Persist changes
+    p["status"] = "configured" if p.get("status") in ["data_loaded", "configured"] else p.get("status")
+    upsert_project(p)
+
+    st.write("")
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        st.markdown('<div class="btn-row">', unsafe_allow_html=True)
+        st.button("⬅ Back to Data", use_container_width=True, on_click=request_nav, args=("data",))
+        st.markdown("</div>", unsafe_allow_html=True)
+    with c2:
+        st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
+        st.button(
+            "Continue to Preprocess ➜",
+            use_container_width=True,
+            on_click=request_nav,
+            args=("preprocess",),
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def page_preprocess():
@@ -1445,6 +1650,7 @@ def page_preprocess():
     st.write("### Dataset Summary")
     st.write(f"**Project:** {p.get('name')}")
     st.write(f"**Rows:** {ds.get('rows', 0)} • **Features:** {len(cols_cfg.get('features', []))} • **Target:** {cols_cfg.get('target', '—')}")
+    st.write(f"**Model:** {p.get('model_type', 'ann').upper()}")
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.write("")
@@ -1453,7 +1659,12 @@ def page_preprocess():
     p["preprocess"]["missing_strategy"] = st.selectbox(
         "Strategy",
         ["Drop rows", "Fill with mean/median", "Forward fill (time-series)"],
-        index=_safe_index(["Drop rows", "Fill with mean/median", "Forward fill (time-series)"], p["preprocess"].get("missing_strategy"), 0),
+        index=_safe_index(
+            ["Drop rows", "Fill with mean/median", "Forward fill (time-series)"],
+            p["preprocess"].get("missing_strategy"),
+            0,
+        ),
+        key=f"miss__{p['id']}",
     )
     st.caption("ANN uses imputers automatically; LSTM cleans & forward/back fills after encoding.")
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1461,109 +1672,52 @@ def page_preprocess():
     st.write("")
     st.markdown('<div class="ns-card">', unsafe_allow_html=True)
     st.write("### Train/Test Split")
-    split = st.slider("Train %", 50, 95, int(float(p["preprocess"].get("split", 0.8)) * 100))
+    split = st.slider("Train %", 50, 95, int(float(p["preprocess"].get("split", 0.8)) * 100), key=f"split__{p['id']}")
     p["preprocess"]["split"] = split / 100.0
-    p["preprocess"]["seed"] = st.number_input("Random Seed", value=int(p["preprocess"].get("seed", 42)), step=1)
+    p["preprocess"]["seed"] = st.number_input("Random Seed", value=int(p["preprocess"].get("seed", 42)), step=1, key=f"seed__{p['id']}")
     st.caption(f"Train: {split}% • Test: {100 - split}%")
     st.markdown("</div>", unsafe_allow_html=True)
 
+    # ✅ Show LSTM time settings ONLY when LSTM selected
     st.write("")
-    st.markdown('<div class="ns-card" style="border-color:#c4b5fd; background:#faf5ff;">', unsafe_allow_html=True)
-    st.write("### LSTM / Time Series Settings")
-    p["preprocess"]["lookback"] = st.number_input("Lookback window", value=int(p["preprocess"].get("lookback", 20)), min_value=1, step=1)
-    p["preprocess"]["horizon"] = st.number_input("Forecast horizon (steps ahead)", value=int(p["preprocess"].get("horizon", 1)), min_value=1, step=1)
-    st.caption("Multivariate LSTM uses past lookback rows of (features + target) to predict target at horizon.")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    upsert_project(p)
-
-    st.write("")
-    c1, c2 = st.columns(2, gap="large")
-    with c1:
-        st.markdown('<div class="btn-row">', unsafe_allow_html=True)
-        st.button("⬅ Back to Data", use_container_width=True, on_click=request_nav, args=("data",))
-        st.markdown("</div>", unsafe_allow_html=True)
-    with c2:
-        st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
-        st.button(
-            "Continue to Model Configuration ➜",
-            use_container_width=True,
-            on_click=lambda: (p.__setitem__("status", "preprocessed"), upsert_project(p), request_nav("model")),
+    if p.get("model_type") == "lstm":
+        st.markdown('<div class="ns-card" style="border-color:#c4b5fd; background:#faf5ff;">', unsafe_allow_html=True)
+        st.write("### LSTM / Time Series Settings")
+        p["preprocess"]["lookback"] = st.number_input(
+            "Lookback window",
+            value=int(p["preprocess"].get("lookback", 20)),
+            min_value=1,
+            step=1,
+            key=f"lookback__{p['id']}",
         )
-        st.markdown("</div>", unsafe_allow_html=True)
-
-
-def page_model():
-    p = ensure_current_project()
-    if p is None:
-        st.warning("No current project.")
-        return
-
-    st.title("Model")
-    status_bar(p.get("status", "data_loaded"))
-
-    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-    st.write("### Model Type")
-    model_type = st.radio("Choose", ["ann", "lstm"], index=0 if p.get("model_type") == "ann" else 1, horizontal=True)
-    p["model_type"] = model_type
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.write("")
-    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-    st.write("### Task Type")
-    task_type = st.selectbox(
-        "Task",
-        ["auto-detect", "classification", "regression"],
-        index=_safe_index(["auto-detect", "classification", "regression"], p.get("task_type", "classification"), 1),
-    )
-    p["task_type"] = task_type
-    st.caption("For LSTM, task is always regression (time-series forecasting).")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.write("")
-    if model_type == "ann":
-        st.markdown('<div class="ns-card" style="background:#faf5ff; border-color:#ddd6fe;">', unsafe_allow_html=True)
-        st.write("### ANN Configuration (Applied for real ✅)")
-        p.setdefault("ann_config", {})
-        p["ann_config"]["hidden_layers"] = st.number_input("Hidden layers", min_value=1, max_value=12, value=int(p["ann_config"].get("hidden_layers", 3)))
-        hl = int(p["ann_config"]["hidden_layers"])
-        neurons = p["ann_config"].get("neurons", [256, 128, 64])
-        if not isinstance(neurons, list):
-            neurons = [256, 128, 64]
-        neurons = (neurons + [64] * hl)[:hl]
-        new_neurons = []
-        for i in range(hl):
-            new_neurons.append(int(st.number_input(f"Neurons in layer {i + 1}", min_value=1, max_value=2048, value=int(neurons[i]))))
-        p["ann_config"]["neurons"] = new_neurons
-        p["ann_config"]["activation"] = st.selectbox("Activation", ["ReLU", "Tanh", "Sigmoid"], index=_safe_index(["ReLU", "Tanh", "Sigmoid"], p["ann_config"].get("activation", "ReLU"), 0))
-        p["ann_config"]["output_activation"] = st.selectbox("Output activation", ["Auto", "Linear", "Sigmoid", "Softmax"], index=_safe_index(["Auto", "Linear", "Sigmoid", "Softmax"], p["ann_config"].get("output_activation", "Auto"), 0))
-        st.caption("These settings are used during ANN training.")
+        p["preprocess"]["horizon"] = st.number_input(
+            "Forecast horizon (steps ahead)",
+            value=int(p["preprocess"].get("horizon", 1)),
+            min_value=1,
+            step=1,
+            key=f"horizon__{p['id']}",
+        )
+        st.caption("Multivariate LSTM uses past lookback rows of (features + target) to predict target at horizon.")
         st.markdown("</div>", unsafe_allow_html=True)
     else:
-        st.markdown('<div class="ns-card" style="background:#ecfeff; border-color:#a5f3fc;">', unsafe_allow_html=True)
-        st.write("### LSTM Configuration (Multivariate ✅)")
-        p.setdefault("lstm_config", {})
-        p["lstm_config"]["units"] = st.number_input("LSTM units", min_value=1, max_value=2048, value=int(p["lstm_config"].get("units", 64)))
-        p["lstm_config"]["layers"] = st.number_input("Number of LSTM layers (stored)", min_value=1, max_value=6, value=int(p["lstm_config"].get("layers", 2)))
-        p["lstm_config"]["dropout"] = st.slider("Dropout rate", 0.0, 0.8, float(p["lstm_config"].get("dropout", 0.2)))
-        p["lstm_config"]["bidirectional"] = st.checkbox("Bidirectional (stored)", value=bool(p["lstm_config"].get("bidirectional", False)))
-        st.caption("This LSTM uses selected FEATURES + past TARGET to predict future TARGET.")
-        st.markdown("</div>", unsafe_allow_html=True)
+        st.info("You selected ANN. Time-series settings are hidden because they are only needed for LSTM.")
 
+    # Save preprocess changes
+    p["status"] = "preprocessed" if p.get("status") in ["configured", "preprocessed"] else p.get("status")
     upsert_project(p)
 
     st.write("")
     c1, c2 = st.columns(2, gap="large")
     with c1:
         st.markdown('<div class="btn-row">', unsafe_allow_html=True)
-        st.button("⬅ Back to Preprocess", use_container_width=True, on_click=request_nav, args=("preprocess",))
+        st.button("⬅ Back to Model", use_container_width=True, on_click=request_nav, args=("model",))
         st.markdown("</div>", unsafe_allow_html=True)
     with c2:
         st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
         st.button(
             "Continue to Training ➜",
             use_container_width=True,
-            on_click=lambda: (p.__setitem__("status", "configured"), upsert_project(p), request_nav("train")),
+            on_click=lambda: (p.__setitem__("status", "preprocessed"), upsert_project(p), request_nav("train")),
         )
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1595,14 +1749,37 @@ def page_train():
     st.write("### Training Configuration")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        p["train_config"]["epochs"] = int(st.number_input("Epochs", min_value=1, max_value=500, value=int(p["train_config"]["epochs"])))
+        p["train_config"]["epochs"] = int(
+            st.number_input("Epochs", min_value=1, max_value=500, value=int(p["train_config"]["epochs"]), key=f"ep__{p['id']}")
+        )
     with c2:
-        p["train_config"]["batch_size"] = int(st.number_input("Batch size", min_value=1, max_value=2048, value=int(p["train_config"]["batch_size"])))
+        p["train_config"]["batch_size"] = int(
+            st.number_input("Batch size", min_value=1, max_value=2048, value=int(p["train_config"]["batch_size"]), key=f"bs__{p['id']}")
+        )
+
+    # ✅ LR only for ANN (prevents ANN setting from appearing for LSTM)
     with c3:
-        p["train_config"]["lr"] = float(st.number_input("Learning rate (ANN only)", min_value=1e-6, max_value=1.0, value=float(p["train_config"]["lr"]), format="%.6f"))
+        if p.get("model_type") == "ann":
+            p["train_config"]["lr"] = float(
+                st.number_input(
+                    "Learning rate (ANN)",
+                    min_value=1e-6,
+                    max_value=1.0,
+                    value=float(p["train_config"]["lr"]),
+                    format="%.6f",
+                    key=f"lr__{p['id']}",
+                )
+            )
+        else:
+            st.markdown("**Learning rate**")
+            st.caption("Used internally by LSTM optimizer (fixed).")
+
     with c4:
-        p["train_config"]["patience"] = int(st.number_input("Early stop patience", min_value=1, max_value=50, value=int(p["train_config"]["patience"])))
-    p["train_config"]["early_stop"] = st.checkbox("Enable early stopping", value=bool(p["train_config"]["early_stop"]))
+        p["train_config"]["patience"] = int(
+            st.number_input("Early stop patience", min_value=1, max_value=50, value=int(p["train_config"]["patience"]), key=f"pat__{p['id']}")
+        )
+
+    p["train_config"]["early_stop"] = st.checkbox("Enable early stopping", value=bool(p["train_config"]["early_stop"]), key=f"es__{p['id']}")
     st.markdown("</div>", unsafe_allow_html=True)
 
     upsert_project(p)
@@ -1637,7 +1814,7 @@ def page_train():
 
         epochs = int(p["train_config"]["epochs"])
         batch_size = int(p["train_config"]["batch_size"])
-        lr = float(p["train_config"]["lr"])
+        lr = float(p["train_config"].get("lr", 0.001))
         early_stop = bool(p["train_config"]["early_stop"])
         patience = int(p["train_config"]["patience"])
         seed = int(p["preprocess"]["seed"])
@@ -1651,7 +1828,7 @@ def page_train():
                 st.error("Select feature columns in Data page first (ANN needs features).")
                 return
 
-            ui_task = p.get("task_type", "classification")
+            ui_task = p.get("task_type", "auto-detect")
             task_choice = "auto" if ui_task == "auto-detect" else ui_task
 
             try:
@@ -1816,7 +1993,7 @@ def page_train():
     c1, c2 = st.columns(2, gap="large")
     with c1:
         st.markdown('<div class="btn-row">', unsafe_allow_html=True)
-        st.button("⬅ Back to Model", use_container_width=True, on_click=request_nav, args=("model",))
+        st.button("⬅ Back to Preprocess", use_container_width=True, on_click=request_nav, args=("preprocess",))
         st.markdown("</div>", unsafe_allow_html=True)
     with c2:
         st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
@@ -2400,6 +2577,9 @@ def page_save_load():
             loaded.setdefault("lstm_config", {"units": 64, "layers": 2, "dropout": 0.2, "bidirectional": False})
             loaded.setdefault("viz_cache", {})
             loaded.setdefault("target_profile", {})
+            # Ensure model/task coherence
+            if loaded.get("model_type") == "lstm":
+                loaded["task_type"] = "regression"
             upsert_project(loaded)
             request_nav("data")
         except Exception as e:
@@ -2414,12 +2594,13 @@ def page_save_load():
 
 # ============================================================
 # Routing (✅ requested order)
+# Home → Data → Model → Preprocess → Train → Evaluate → Predict → Visualize → Save/Load
 # ============================================================
 PAGES = {
     "home": ("Home", page_home),
     "data": ("Data Upload", page_data),
-    "preprocess": ("Preprocess", page_preprocess),
     "model": ("Model", page_model),
+    "preprocess": ("Preprocess", page_preprocess),
     "train": ("Train", page_train),
     "evaluate": ("Evaluate", page_evaluate),
     "predict": ("Predict", page_predict),
