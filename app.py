@@ -1,12 +1,3 @@
-# UI_test.py (Single-file: UI + ANN backend + LSTM backend)
-# ✅ PRO UPDATE: ANN supports Classification + Regression (with pro plots: ROC/PR/Threshold + Residuals + Actual vs Pred)
-# ✅ PRO UPDATE: LSTM supports BOTH Regression (forecasting) + Classification (sequence classification)
-# ✅ PRO UPDATE: Visualize upgraded for ALL modes (ANN cls/reg + LSTM cls/reg)
-# ✅ SPEED: Lazy import sklearn + matplotlib + tensorflow (faster startup / faster page switching)
-# ✅ FIX: Correct flow order (Home → Data → Model → Preprocess → Train → Evaluate → Predict → Visualize → Save/Load)
-# ✅ FIX: Hide irrelevant settings (no cross-settings confusion)
-# ✅ FIX: No "double click" when switching Model Type / Task (on_change + st.rerun)
-
 from __future__ import annotations
 
 import json
@@ -3237,3 +3228,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
