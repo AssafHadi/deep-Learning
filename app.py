@@ -1,12 +1,3 @@
-# UI_test.py (Single-file: UI + ANN backend + LSTM backend)
-# ✅ PRO UPDATE: ANN supports Classification + Regression (with pro plots: ROC/PR/Threshold + Residuals + Actual vs Pred)
-# ✅ PRO UPDATE: LSTM supports BOTH Regression (forecasting) + Classification (sequence classification)
-# ✅ PRO UPDATE: Visualize upgraded for ALL modes (ANN cls/reg + LSTM cls/reg)
-# ✅ SPEED: Lazy import sklearn + matplotlib + tensorflow (faster startup / faster page switching)
-# ✅ FIX: Correct flow order (Home → Data → Model → Preprocess → Train → Evaluate → Predict → Visualize → Save/Load)
-# ✅ FIX: Hide irrelevant settings (no cross-settings confusion)
-# ✅ FIX: No "double click" when switching Model Type / Task (on_change + st.rerun)
-
 from __future__ import annotations
 
 import json
@@ -3444,17 +3435,7 @@ def page_cnn():
     with left_col:
         train_clicked = st.button("Start Training", type="primary", key="cnn_train_btn")
 
-    with right_col:
-        st.markdown("""
-        <div class='cnn-info-card'>
-            <b>Model Summary</b><br><br>
-            • CNN regression model<br>
-            • Iteration-based progress tracking<br>
-            • Validation at periodic iteration checks<br>
-            • Learning-rate reduction after epoch 20<br>
-            • MATLAB-style stacked training plots
-        </div>
-        """, unsafe_allow_html=True)
+    
 
     if train_clicked:
         try:
@@ -3745,3 +3726,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
