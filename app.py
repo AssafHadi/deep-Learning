@@ -1,3 +1,12 @@
+# UI_test.py (Single-file: UI + ANN backend + LSTM backend)
+# ✅ PRO UPDATE: ANN supports Classification + Regression (with pro plots: ROC/PR/Threshold + Residuals + Actual vs Pred)
+# ✅ PRO UPDATE: LSTM supports BOTH Regression (forecasting) + Classification (sequence classification)
+# ✅ PRO UPDATE: Visualize upgraded for ALL modes (ANN cls/reg + LSTM cls/reg)
+# ✅ SPEED: Lazy import sklearn + matplotlib + tensorflow (faster startup / faster page switching)
+# ✅ FIX: Correct flow order (Home → Data → Model → Preprocess → Train → Evaluate → Predict → Visualize → Save/Load)
+# ✅ FIX: Hide irrelevant settings (no cross-settings confusion)
+# ✅ FIX: No "double click" when switching Model Type / Task (on_change + st.rerun)
+
 from __future__ import annotations
 
 import json
@@ -1274,10 +1283,14 @@ def bottom_nav(active: str):
         ("visualize", "Visualize"),
         ("save", "Save"),
     ]
+
+    highlight = "model" if active == "cnn" else active
+
     links = []
     for key, label in items:
-        cls = "active" if key == active else ""
+        cls = "active" if key == highlight else ""
         links.append(f'<a class="{cls}" href="?page={key}">{label}</a>')
+
     st.markdown(
         f"""
         <div class="bottom-nav">
@@ -1818,7 +1831,6 @@ def page_model():
         new_model = st.session_state.get(key, "ann")
         p2["model_type"] = new_model
 
-        # Reset artifacts/metrics when switching model
         p2["evaluation_metrics"] = None
         p2["artifacts"] = None
         p2["history"] = {"loss": [], "val_loss": []}
@@ -1827,7 +1839,11 @@ def page_model():
 
         p2["status"] = "configured"
         upsert_project(p2)
-        st.rerun()
+
+        if new_model == "cnn":
+            goto("cnn")
+        else:
+            st.rerun()
 
     def _apply_task_change():
         p2 = ensure_current_project()
@@ -1837,7 +1853,6 @@ def page_model():
         new_task = st.session_state.get(key, "auto-detect")
         p2["task_type"] = new_task
 
-        # Reset outputs when task changes
         p2["evaluation_metrics"] = None
         p2["artifacts"] = None
         p2["history"] = {"loss": [], "val_loss": []}
@@ -1852,12 +1867,18 @@ def page_model():
     st.write("### Model Type")
 
     default_model = p.get("model_type", "ann")
+    if default_model not in ["ann", "lstm", "cnn"]:
+        default_model = "ann"
+
     st.session_state.setdefault(f"model_type__{p['id']}", default_model)
+
+    model_options = ["ann", "lstm", "cnn"]
+    current_model = st.session_state[f"model_type__{p['id']}"]
 
     st.radio(
         "Choose",
-        ["ann", "lstm"],
-        index=0 if st.session_state[f"model_type__{p['id']}"] == "ann" else 1,
+        model_options,
+        index=_safe_index(model_options, current_model, 0),
         horizontal=True,
         key=f"model_type__{p['id']}",
         on_change=_apply_model_change,
@@ -1865,6 +1886,28 @@ def page_model():
 
     p["model_type"] = st.session_state[f"model_type__{p['id']}"]
     st.markdown("</div>", unsafe_allow_html=True)
+
+    # CNN selected -> go straight to CNN page
+    if p["model_type"] == "cnn":
+        st.info("CNN selected. Open the dedicated CNN interface.")
+        st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
+        st.button("Open CNN Interface ➜", use_container_width=True, on_click=goto, args=("cnn",))
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        p["status"] = "configured"
+        upsert_project(p)
+
+        st.write("")
+        c1, c2 = st.columns(2, gap="large")
+        with c1:
+            st.markdown('<div class="btn-row">', unsafe_allow_html=True)
+            st.button("⬅ Back to Data", use_container_width=True, on_click=request_nav, args=("data",))
+            st.markdown("</div>", unsafe_allow_html=True)
+        with c2:
+            st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
+            st.button("Go to CNN Page ➜", use_container_width=True, on_click=goto, args=("cnn",))
+            st.markdown("</div>", unsafe_allow_html=True)
+        return
 
     st.write("")
     st.markdown('<div class="ns-card">', unsafe_allow_html=True)
@@ -1934,8 +1977,6 @@ def page_model():
             index=_safe_index(["Auto", "Linear", "Sigmoid", "Softmax"], p["ann_config"].get("output_activation", "Auto"), 0),
             key=f"ann_outact__{p['id']}",
         )
-
-        # Threshold slider shown only when binary classification later (still safe to keep here)
         p["ann_threshold"] = float(
             st.slider("Binary classification threshold (used in Predict)", 0.05, 0.95, float(p.get("ann_threshold", 0.5)))
         )
@@ -3154,7 +3195,479 @@ def page_save_load():
     st.button("⬅ Back to Visualize", use_container_width=True, on_click=request_nav, args=("visualize",))
     st.markdown("</div>", unsafe_allow_html=True)
 
+def page_cnn():
+    st.title("CNN")
+    st.caption("CNN interface")
+    c1, c2 = st.columns([1, 6])
+    with c1:
+        st.button("⬅ Back", on_click=goto, args=("model",))
 
+    # CNN page-local style
+    st.markdown("""
+    <style>
+    .cnn-section-card {
+        padding: 16px 18px;
+        border-radius: 12px;
+        border: 1px solid rgba(0,0,0,0.08);
+        background: #ffffff;
+        margin-bottom: 16px;
+    }
+    .cnn-info-card {
+        padding: 14px 16px;
+        border-radius: 12px;
+        border: 1px solid rgba(0,0,0,0.08);
+        background: #f8fafc;
+    }
+    .cnn-section-title {
+        font-size: 24px;
+        font-weight: 700;
+        margin-top: 10px;
+        margin-bottom: 8px;
+        color: #1f2937;
+    }
+    .cnn-subtle {
+        color: #667085;
+        font-size: 13px;
+        line-height: 1.5;
+    }
+    .cnn-result-card {
+        padding: 12px 14px;
+        border-radius: 12px;
+        border: 1px solid rgba(0,0,0,0.07);
+        background: #ffffff;
+        text-align: center;
+        margin-bottom: 12px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    plt = _get_plt()
+    _apply_plot_style(plt)
+
+    tf = _get_tf()
+    from tensorflow.keras import layers, models
+    from tensorflow.keras.datasets import mnist
+    from scipy.ndimage import rotate
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import mean_squared_error
+    from PIL import Image
+
+    # -------------------------
+    # Local helpers for CNN page
+    # -------------------------
+    def moving_average(x, w=25):
+        x = np.asarray(x, dtype=float)
+        if len(x) == 0:
+            return x
+        if w <= 1 or len(x) < w:
+            return x
+        return np.convolve(x, np.ones(w) / w, mode="same")
+
+    class MatlabProgress(tf.keras.callbacks.Callback):
+        def __init__(self, val_data, val_freq_iters: int):
+            super().__init__()
+            self.xv, self.yv = val_data
+            self.val_freq_iters = max(1, int(val_freq_iters))
+
+            self.iters = []
+            self.train_loss = []
+            self.train_rmse = []
+
+            self.val_iters = []
+            self.val_loss = []
+            self.val_rmse = []
+
+        def on_train_batch_end(self, batch, logs=None):
+            logs = logs or {}
+            i = len(self.train_loss) + 1
+
+            self.iters.append(i)
+            self.train_loss.append(float(logs.get("loss", np.nan)))
+            self.train_rmse.append(float(logs.get("root_mean_squared_error", np.nan)))
+
+            if i % self.val_freq_iters == 0:
+                v = self.model.evaluate(self.xv, self.yv, verbose=0, return_dict=True)
+                self.val_iters.append(i)
+                self.val_loss.append(float(v.get("loss", np.nan)))
+                self.val_rmse.append(float(v.get("root_mean_squared_error", np.nan)))
+
+    @st.cache_resource(show_spinner=False)
+    def prepare_data(seed: int = 42, n_train: int = 5000, n_test: int = 5000):
+        (x_train, _), (x_test, _) = mnist.load_data()
+
+        x_train = x_train[:n_train].astype("float32") / 255.0
+        x_test = x_test[:n_test].astype("float32") / 255.0
+
+        x_train = np.expand_dims(x_train, -1)
+        x_test = np.expand_dims(x_test, -1)
+
+        rng = np.random.default_rng(seed)
+
+        def rotate_set(images):
+            imgs, angles = [], []
+            for img in images:
+                angle = float(rng.uniform(-45, 45))
+                rotated = rotate(
+                    img.squeeze(),
+                    angle,
+                    reshape=False,
+                    order=1,
+                    mode="constant",
+                    cval=0.0
+                )
+                imgs.append(np.expand_dims(rotated, -1))
+                angles.append(angle)
+            return np.array(imgs, dtype="float32"), np.array(angles, dtype="float32")
+
+        x_train_rot, y_train = rotate_set(x_train)
+        x_test_rot, y_test = rotate_set(x_test)
+
+        x_train_rot, x_val, y_train, y_val = train_test_split(
+            x_train_rot, y_train, test_size=0.15, random_state=seed
+        )
+
+        return x_train_rot, y_train, x_val, y_val, x_test_rot, y_test
+
+    def build_model():
+        model = models.Sequential([
+            layers.Input(shape=(28, 28, 1)),
+
+            layers.Conv2D(8, 3, padding="same"),
+            layers.BatchNormalization(),
+            layers.ReLU(),
+            layers.AveragePooling2D(2, strides=2),
+
+            layers.Conv2D(16, 3, padding="same"),
+            layers.BatchNormalization(),
+            layers.ReLU(),
+            layers.AveragePooling2D(2, strides=2),
+
+            layers.Conv2D(32, 3, padding="same"),
+            layers.BatchNormalization(),
+            layers.ReLU(),
+
+            layers.Conv2D(32, 3, padding="same"),
+            layers.BatchNormalization(),
+            layers.ReLU(),
+
+            layers.Flatten(),
+            layers.Dense(1)
+        ])
+
+        optimizer = tf.keras.optimizers.SGD(
+            learning_rate=1e-3,
+            momentum=0.9
+        )
+
+        model.compile(
+            optimizer=optimizer,
+            loss="mse",
+            metrics=[tf.keras.metrics.RootMeanSquaredError()]
+        )
+        return model
+
+    def lr_schedule(epoch, lr):
+        return 1e-3 if epoch < 20 else 1e-4
+
+    # -------------------------
+    # CNN session keys
+    # -------------------------
+    if "cnn_uploaded_prediction_files" not in st.session_state:
+        st.session_state.cnn_uploaded_prediction_files = []
+
+    if "cnn_training_done" not in st.session_state:
+        st.session_state.cnn_training_done = False
+
+    # -------------------------
+    # CNN UI
+    # -------------------------
+    st.markdown("<div class='cnn-section-title'>1. Upload Images</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='cnn-subtle'>Upload one or more images first. Prediction will appear after training.</div>",
+        unsafe_allow_html=True
+    )
+
+    uploaded_files = st.file_uploader(
+        "Select image files",
+        type=["png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        key="cnn_prediction_uploader"
+    )
+
+    if uploaded_files:
+        st.session_state.cnn_uploaded_prediction_files = uploaded_files
+
+    saved_files = st.session_state.cnn_uploaded_prediction_files
+
+    if saved_files:
+        st.markdown("<div class='cnn-section-card'>", unsafe_allow_html=True)
+        st.markdown("#### Uploaded Image Preview")
+        preview_cols = st.columns(5)
+
+        for idx, file in enumerate(saved_files):
+            try:
+                file.seek(0)
+            except Exception:
+                pass
+            img = Image.open(file).convert("L").resize((28, 28))
+            preview_cols[idx % 5].image(img, caption=file.name, width=120)
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='cnn-section-title'>2. Training Configuration</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='cnn-section-card'>", unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        seed = st.number_input("Random Seed", min_value=0, max_value=999999, value=42, step=1, key="cnn_seed")
+        n_train = st.selectbox("Training Samples", [2000, 5000, 8000], index=1, key="cnn_n_train")
+
+    with c2:
+        n_test = st.selectbox("Test Samples", [1000, 5000], index=1, key="cnn_n_test")
+        epochs = st.slider("Epochs", 5, 60, 30, 1, key="cnn_epochs")
+
+    with c3:
+        batch_size = st.selectbox("Batch Size", [32, 64, 128, 256], index=2, key="cnn_batch")
+        smooth_w = st.slider("Curve Smoothing", 1, 75, 25, 1, key="cnn_smooth")
+
+    st.markdown(
+        "<div class='cnn-subtle'>Closest MATLAB settings: Seed 42, Training Samples 5000, Test Samples 5000, Epochs 30, Batch Size 128, Curve Smoothing 25.</div>",
+        unsafe_allow_html=True
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='cnn-section-title'>3. Train Model</div>", unsafe_allow_html=True)
+
+    left_col, right_col = st.columns([1.3, 0.95])
+
+    with left_col:
+        train_clicked = st.button("Start Training", type="primary", key="cnn_train_btn")
+
+    with right_col:
+        st.markdown("""
+        <div class='cnn-info-card'>
+            <b>Model Summary</b><br><br>
+            • CNN regression model<br>
+            • Iteration-based progress tracking<br>
+            • Validation at periodic iteration checks<br>
+            • Learning-rate reduction after epoch 20<br>
+            • MATLAB-style stacked training plots
+        </div>
+        """, unsafe_allow_html=True)
+
+    if train_clicked:
+        try:
+            with st.spinner("Preparing training data..."):
+                x_train, y_train, x_val, y_val, x_test, y_test = prepare_data(
+                    seed=int(seed),
+                    n_train=int(n_train),
+                    n_test=int(n_test)
+                )
+
+            val_freq_iters = max(1, len(y_train) // int(batch_size))
+
+            model = build_model()
+            lr_cb = tf.keras.callbacks.LearningRateScheduler(lr_schedule, verbose=0)
+            mp = MatlabProgress(val_data=(x_val, y_val), val_freq_iters=val_freq_iters)
+
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+
+            class StreamlitProgress(tf.keras.callbacks.Callback):
+                def on_epoch_end(self, epoch, logs=None):
+                    pct = int(((epoch + 1) / int(epochs)) * 100)
+                    progress_bar.progress(min(pct, 100))
+                    logs = logs or {}
+                    loss = logs.get("loss", np.nan)
+                    rmse = logs.get("root_mean_squared_error", np.nan)
+                    status_text.markdown(
+                        f"**Training progress:** Epoch {epoch + 1}/{int(epochs)} "
+                        f"&nbsp;&nbsp;|&nbsp;&nbsp; Loss: {loss:.4f} "
+                        f"&nbsp;&nbsp;|&nbsp;&nbsp; RMSE: {rmse:.4f}"
+                    )
+
+            with st.spinner("Training model..."):
+                model.fit(
+                    x_train, y_train,
+                    epochs=int(epochs),
+                    batch_size=int(batch_size),
+                    shuffle=True,
+                    callbacks=[lr_cb, mp, StreamlitProgress()],
+                    verbose=0
+                )
+
+            progress_bar.progress(100)
+            status_text.markdown("**Training progress:** Completed")
+
+            y_pred = model.predict(x_test, verbose=0).flatten()
+            test_rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+
+            st.session_state.cnn_model = model
+            st.session_state.cnn_mp = mp
+            st.session_state.cnn_test_rmse = test_rmse
+            st.session_state.cnn_y_test = y_test
+            st.session_state.cnn_y_pred = y_pred
+            st.session_state.cnn_training_done = True
+
+            st.success("Model training completed successfully.")
+
+        except Exception as e:
+            st.session_state.cnn_training_done = False
+            st.error(f"Training failed: {e}")
+
+    if "cnn_mp" in st.session_state and st.session_state.cnn_training_done:
+        mp = st.session_state.cnn_mp
+        test_rmse = st.session_state.cnn_test_rmse
+        y_test = st.session_state.cnn_y_test
+        y_pred = st.session_state.cnn_y_pred
+
+        st.markdown("<div class='cnn-section-title'>4. Performance Overview</div>", unsafe_allow_html=True)
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Test RMSE", f"{test_rmse:.2f}°")
+        m2.metric("Training Iterations", f"{len(mp.iters)}")
+        m3.metric("Validation Checks", f"{len(mp.val_iters)}")
+
+        st.markdown("<div class='cnn-section-card'>", unsafe_allow_html=True)
+        st.markdown("#### Training Curves")
+
+        fig, (ax_top, ax_bot) = plt.subplots(
+            2, 1,
+            figsize=(14, 9.5),
+            sharex=True,
+            gridspec_kw={"hspace": 0.32}
+        )
+
+        tr_rmse = moving_average(mp.train_rmse, w=max(1, int(smooth_w)))
+        tr_loss = moving_average(mp.train_loss, w=max(1, int(smooth_w)))
+
+        # RMSE
+        ax_top.plot(mp.iters, tr_rmse, linewidth=2.4, label="Training RMSE")
+        if len(mp.val_iters) > 0:
+            ax_top.plot(mp.val_iters, mp.val_rmse, linewidth=2.4, label="Validation RMSE")
+
+        ax_top.set_ylabel("RMSE", fontsize=12, fontweight="bold")
+        ax_top.set_title("RMSE by Iteration", fontsize=16, fontweight="bold", pad=12)
+        ax_top.tick_params(axis="both", labelsize=11)
+        ax_top.grid(True, alpha=0.28)
+        ax_top.legend(loc="upper right", fontsize=11)
+
+        # Loss
+        ax_bot.plot(mp.iters, tr_loss, linewidth=2.4, label="Training Loss")
+        if len(mp.val_iters) > 0:
+            ax_bot.plot(mp.val_iters, mp.val_loss, linewidth=2.4, label="Validation Loss")
+
+        ax_bot.set_xlabel("Iteration", fontsize=12, fontweight="bold")
+        ax_bot.set_ylabel("Loss", fontsize=12, fontweight="bold")
+        ax_bot.set_title("Loss by Iteration", fontsize=16, fontweight="bold", pad=12)
+        ax_bot.tick_params(axis="both", labelsize=11)
+        ax_bot.grid(True, alpha=0.28)
+        ax_bot.legend(loc="upper right", fontsize=11)
+
+        for ax in (ax_top, ax_bot):
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+
+        fig.tight_layout(pad=2.0)
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown("<div class='cnn-section-card'>", unsafe_allow_html=True)
+        st.markdown("#### Predicted vs Actual")
+
+        fig_sc, ax_sc = plt.subplots(figsize=(11, 9))
+
+        ax_sc.scatter(
+            y_pred,
+            y_test,
+            alpha=0.28,
+            s=24
+        )
+
+        axis_min = min(float(np.min(y_pred)), float(np.min(y_test)), -60)
+        axis_max = max(float(np.max(y_pred)), float(np.max(y_test)), 60)
+
+        ax_sc.plot(
+            [axis_min, axis_max],
+            [axis_min, axis_max],
+            "r--",
+            linewidth=2.2,
+            label="Ideal Fit"
+        )
+
+        ax_sc.set_xlim(axis_min - 2, axis_max + 2)
+        ax_sc.set_ylim(axis_min - 2, axis_max + 2)
+
+        ax_sc.set_xlabel("Predicted Angle", fontsize=12, fontweight="bold")
+        ax_sc.set_ylabel("Actual Angle", fontsize=12, fontweight="bold")
+        ax_sc.set_title("Predicted vs Actual Rotation Angle", fontsize=17, fontweight="bold", pad=14)
+
+        ax_sc.tick_params(axis="both", labelsize=11)
+        ax_sc.grid(True, alpha=0.28)
+        ax_sc.legend(loc="upper left", fontsize=11)
+
+        ax_sc.spines["top"].set_visible(False)
+        ax_sc.spines["right"].set_visible(False)
+
+        fig_sc.tight_layout(pad=1.8)
+        st.pyplot(fig_sc, use_container_width=True)
+        plt.close(fig_sc)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    else:
+        st.info("Train the model to display evaluation results and charts.")
+
+    st.markdown("<div class='cnn-section-title'>5. Image Prediction</div>", unsafe_allow_html=True)
+
+    if saved_files:
+        if "cnn_model" not in st.session_state or not st.session_state.cnn_training_done:
+            st.warning("Images are ready. Train the model first to generate predictions.")
+        else:
+            model = st.session_state.cnn_model
+            results = []
+
+            st.markdown("<div class='cnn-section-card'>", unsafe_allow_html=True)
+            st.markdown("#### Prediction Results")
+
+            grid_cols = st.columns(4)
+
+            for idx, file in enumerate(saved_files):
+                try:
+                    file.seek(0)
+                except Exception:
+                    pass
+
+                img = Image.open(file).convert("L").resize((28, 28))
+                arr = np.array(img).astype("float32") / 255.0
+                arr = np.expand_dims(arr, -1)
+                arr = np.expand_dims(arr, 0)
+
+                pred = float(model.predict(arr, verbose=0)[0][0])
+
+                results.append({
+                    "Image": file.name,
+                    "Predicted Angle (°)": round(pred, 2)
+                })
+
+                with grid_cols[idx % 4]:
+                    st.image(img, width=150)
+                    st.markdown(
+                        f"""
+                        <div class="cnn-result-card">
+                            <b>{file.name}</b><br>
+                            Predicted angle: <b>{pred:.2f}°</b>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+
+            st.markdown("#### Prediction Table")
+            st.dataframe(pd.DataFrame(results), use_container_width=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        st.info("Upload one or more images to prepare prediction input.")
 # ============================================================
 # Routing (requested order)
 # Home → Data → Model → Preprocess → Train → Evaluate → Predict → Visualize → Save/Load
@@ -3169,6 +3682,7 @@ PAGES = {
     "predict": ("Predict", page_predict),
     "visualize": ("Visualize", page_visualize),
     "save": ("Save/Load", page_save_load),
+    "cnn": ("CNN", page_cnn),
 }
 
 
@@ -3191,17 +3705,20 @@ def main():
 
         st.write("")
         page_keys = list(PAGES.keys())
-        labels = [PAGES[k][0] for k in page_keys]
+        nav_page_keys = ["home", "data", "model", "preprocess", "train", "evaluate", "predict", "visualize", "save"]
+        labels = [PAGES[k][0] for k in nav_page_keys]
 
         active_key = st.query_params.get("page", "home")
         if active_key not in PAGES:
             active_key = "home"
 
-        idx = page_keys.index(active_key)
+        sidebar_active_key = "model" if active_key == "cnn" else active_key
+        idx = nav_page_keys.index(sidebar_active_key)
+
         chosen = st.radio("Navigate", labels, index=idx)
 
-        chosen_key = page_keys[labels.index(chosen)]
-        if chosen_key != active_key:
+        chosen_key = nav_page_keys[labels.index(chosen)]
+        if chosen_key != sidebar_active_key:
             request_nav(chosen_key)
 
         st.write("---")
@@ -3228,4 +3745,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
