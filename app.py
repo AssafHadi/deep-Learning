@@ -1,275 +1,339 @@
+
 from __future__ import annotations
 
-import json
 import os
+import sys
+from pathlib import Path
+
+ANN_SOURCE = r'''
+import os
+import io
+import re
+import json
+import math
 import time
-import uuid
-from dataclasses import dataclass
+import zipfile
+import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from sklearn.preprocessing import LabelEncoder
 
-# Quiet TF noise (optional, safe)
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-
+import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
-import joblib
 
-# ============================================================
-# Performance: Lazy import caches
-# ============================================================
-_TF_CACHE: Dict[str, Any] = {}
-_SK_CACHE: Dict[str, Any] = {}
-_PLT_CACHE: Dict[str, Any] = {}
+# ----------------------------- #
+# App metadata / persistence
+# ----------------------------- #
+APP_TITLE = "Oil & Gas ANN Studio"
+APP_SUBTITLE = "MATLAB-style workflow for tabular oil, gas, drilling, reservoir, and production data"
+APP_DIR = Path(".oil_gas_ann_studio")
+PROJECTS_DIR = APP_DIR / "projects"
+PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 
-def auto_train_defaults_from_df(df: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Picks sensible defaults based on dataset size.
-    - Bigger dataset -> more epochs (but capped)
-    - Batch size increases with size
-    - Early stop default OFF (user requested)
-    """
-    n = int(df.shape[0])
-    p = int(df.shape[1])
+# ----------------------------- #
+# Lazy imports
+# ----------------------------- #
+_TF = None
+_PLT = None
 
-    # Base epochs by row count (simple, stable heuristic)
-    if n < 200:
-        epochs = 200
-    elif n < 1000:
-        epochs = 300
-    elif n < 5000:
-        epochs = 500
-    else:
-        epochs = 800
+def get_tf():
+    global _TF
+    if _TF is None:
+        import tensorflow as tf
+        _TF = tf
+    return _TF
 
-    # Slight bump if many columns (harder problem)
-    if p >= 30:
-        epochs = int(min(1000, epochs * 1.2))
+def get_plt():
+    global _PLT
+    if _PLT is None:
+        import matplotlib.pyplot as plt
+        plt.rcParams["figure.dpi"] = 125
+        plt.rcParams["savefig.dpi"] = 125
+        plt.rcParams["axes.titlesize"] = 15
+        plt.rcParams["axes.labelsize"] = 12.5
+        plt.rcParams["xtick.labelsize"] = 10.5
+        plt.rcParams["ytick.labelsize"] = 10.5
+        plt.rcParams["legend.fontsize"] = 10.5
+        _PLT = plt
+    return _PLT
 
-    # Batch size heuristic
-    if n < 500:
-        batch = 16
-    elif n < 5000:
-        batch = 32
-    else:
-        batch = 64
+# sklearn imports
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    mean_absolute_error,
+    mean_squared_error,
+    precision_recall_curve,
+    precision_score,
+    r2_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
+from sklearn.utils.class_weight import compute_class_weight
 
+
+# ----------------------------- #
+# Session state
+# ----------------------------- #
+def default_config() -> Dict[str, Any]:
     return {
-        "epochs": int(min(max(20, epochs), 1000)),  # clamp 20..1000
-        "batch_size": int(min(max(1, batch), 2048)),
-        "lr": 0.001,
-        "early_stop": False,     # ✅ default OFF
-        "patience": 30,          # kept for when user turns ES on
+        "project_name": "oil_gas_ann_project",
+        "task_mode": "Auto Detect",
+        "target_column": None,
+        "feature_columns": [],
+        "drop_columns": [],
+        "auto_datetime": True,
+        "drop_duplicates": True,
+        "shuffle_data": True,
+        "test_size": 0.20,
+        "random_seed": 42,
+        "hidden_layers": "256,128,64",
+        "activation": "relu",
+        "dropout": 0.20,
+        "batch_norm": True,
+        "optimizer": "adam",
+        "learning_rate": 0.001,
+        "epochs": 120,
+        "batch_size": 32,
+        "validation_split": 0.20,
+        "early_stopping": True,
+        "patience": 15,
+        "use_class_weights": True,
+        "threshold": 0.50,
+        "l2_reg": 0.0,
     }
-def _get_tf():
-    """Lazy-load TensorFlow only when training/loading models is needed."""
-    if "tf" in _TF_CACHE:
-        return _TF_CACHE["tf"]
 
-    import tensorflow as tf  # heavy
-    from tensorflow.keras import layers
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.callbacks import EarlyStopping
+def init_state():
+    if "config" not in st.session_state:
+        st.session_state.config = default_config()
+    if "raw_df" not in st.session_state:
+        st.session_state.raw_df = None
+    if "prepared_data" not in st.session_state:
+        st.session_state.prepared_data = None
+    if "trained_model" not in st.session_state:
+        st.session_state.trained_model = None
+    if "training_history" not in st.session_state:
+        st.session_state.training_history = None
+    if "results" not in st.session_state:
+        st.session_state.results = {}
+    if "loaded_project_name" not in st.session_state:
+        st.session_state.loaded_project_name = None
 
-    _TF_CACHE["tf"] = tf
-    _TF_CACHE["layers"] = layers
-    _TF_CACHE["Sequential"] = Sequential
-    _TF_CACHE["EarlyStopping"] = EarlyStopping
-    return tf
-
-
-def _get_tf_keras():
-    """Returns (tf, layers, Sequential, EarlyStopping) lazily."""
-    tf = _get_tf()
-    return tf, _TF_CACHE["layers"], _TF_CACHE["Sequential"], _TF_CACHE["EarlyStopping"]
-
-
-def _get_sklearn():
-    """Lazy-load scikit-learn only when training/evaluation uses it."""
-    if _SK_CACHE.get("loaded"):
-        return _SK_CACHE
-
-    from sklearn.model_selection import train_test_split
-    from sklearn.compose import ColumnTransformer
-    from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder, MinMaxScaler
-    from sklearn.pipeline import Pipeline
-    from sklearn.impute import SimpleImputer
-    from sklearn.metrics import (
-        accuracy_score,
-        precision_score,
-        recall_score,
-        f1_score,
-        confusion_matrix,
-        mean_absolute_error,
-        mean_squared_error,
-        r2_score,
-    )
-
-    _SK_CACHE.update(
-        {
-            "loaded": True,
-            "train_test_split": train_test_split,
-            "ColumnTransformer": ColumnTransformer,
-            "OneHotEncoder": OneHotEncoder,
-            "StandardScaler": StandardScaler,
-            "LabelEncoder": LabelEncoder,
-            "MinMaxScaler": MinMaxScaler,
-            "Pipeline": Pipeline,
-            "SimpleImputer": SimpleImputer,
-            "accuracy_score": accuracy_score,
-            "precision_score": precision_score,
-            "recall_score": recall_score,
-            "f1_score": f1_score,
-            "confusion_matrix": confusion_matrix,
-            "mean_absolute_error": mean_absolute_error,
-            "mean_squared_error": mean_squared_error,
-            "r2_score": r2_score,
+# ----------------------------- #
+# Styling
+# ----------------------------- #
+def inject_css():
+    st.set_page_config(page_title=APP_TITLE, layout="wide", initial_sidebar_state="expanded")
+    st.markdown(
+        """
+        <style>
+        .main {padding-top: 1rem;}
+        .block-container {padding-top: 1.3rem; padding-bottom: 2rem; max-width: 1320px;}
+        .hero {
+            padding: 1.25rem 1.5rem;
+            border-radius: 20px;
+            background: linear-gradient(135deg, #0f172a 0%, #1d4ed8 45%, #0ea5e9 100%);
+            color: white;
+            margin-bottom: 1rem;
+            box-shadow: 0 10px 30px rgba(2,6,23,0.18);
         }
+        .hero h1 {margin: 0; font-size: 2rem; line-height: 1.15;}
+        .hero p {margin: .5rem 0 0 0; font-size: 1rem; opacity: 0.95;}
+        .soft-card {
+            background: #ffffff;
+            border: 1px solid rgba(15,23,42,0.08);
+            border-radius: 18px;
+            padding: 1rem 1rem;
+            box-shadow: 0 6px 22px rgba(15,23,42,0.05);
+            height: 100%;
+        }
+        .metric-card {
+            background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+            border: 1px solid rgba(15,23,42,0.08);
+            border-radius: 18px;
+            padding: 0.8rem 1rem;
+            box-shadow: 0 6px 22px rgba(15,23,42,0.04);
+        }
+        .tiny {font-size: 0.86rem; color: #475569;}
+        .status-pill {
+            display: inline-block;
+            padding: .35rem .65rem;
+            border-radius: 999px;
+            background: #eff6ff;
+            border: 1px solid #bfdbfe;
+            color: #1d4ed8;
+            font-size: .85rem;
+            margin-right: .35rem;
+            margin-bottom: .35rem;
+        }
+        .section-note {
+            padding: .8rem 1rem;
+            border-left: 4px solid #1d4ed8;
+            background: #eff6ff;
+            border-radius: 10px;
+            margin-bottom: 1rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
-    return _SK_CACHE
 
+def hero():
+    st.markdown(
+        f"""
+        <div class="hero">
+            <h1>{APP_TITLE}</h1>
+            <p>{APP_SUBTITLE}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-def _get_plt():
-    """Lazy-load matplotlib only when Visualize page is rendered."""
-    if "plt" in _PLT_CACHE:
-        return _PLT_CACHE["plt"]
-    import matplotlib.pyplot as plt  # heavy-ish
-    _PLT_CACHE["plt"] = plt
-    return plt
-
-
-# ============================================================
-# JSON-safe utilities (fix "not JSON serializable" forever)
-# ============================================================
-def _json_safe(obj: Any) -> Any:
-    if obj is None:
-        return None
-    if isinstance(obj, (str, int, float, bool)):
-        return obj
-    if isinstance(obj, (np.generic,)):
-        return obj.item()
-    if isinstance(obj, (list, tuple)):
-        return [_json_safe(x) for x in obj]
-    if isinstance(obj, dict):
-        return {str(k): _json_safe(v) for k, v in obj.items()}
-    return str(obj)
-
-
-# ============================================================
-# Small utilities
-# ============================================================
-def _safe_index(options: List[Any], value: Any, default: int = 0) -> int:
+# ----------------------------- #
+# Utility helpers
+# ----------------------------- #
+def set_seed(seed: int):
+    np.random.seed(seed)
     try:
-        return options.index(value)
+        tf = get_tf()
+        tf.keras.utils.set_random_seed(seed)
     except Exception:
-        return default
+        pass
 
+def safe_filename(name: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name).strip())
+    return name or "project"
 
-def _clamp_int(x: Any, lo: int, hi: int, default: int) -> int:
-    try:
-        v = int(x)
-        return max(lo, min(hi, v))
-    except Exception:
-        return default
+def parse_hidden_layers(text: str) -> List[int]:
+    values = []
+    for item in str(text).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            v = int(item)
+            if v > 0:
+                values.append(v)
+        except Exception:
+            continue
+    return values or [128, 64]
 
+def read_uploaded_table(uploaded_file) -> pd.DataFrame:
+    suffix = Path(uploaded_file.name).suffix.lower()
+    if suffix == ".csv":
+        return pd.read_csv(uploaded_file)
+    if suffix in {".xlsx", ".xls"}:
+        return pd.read_excel(uploaded_file)
+    raise ValueError("Only CSV, XLSX, and XLS files are supported.")
 
-# ============================================================
-# Navigation (Fixes the “double click” issue for page transitions)
-# ============================================================
-def request_nav(page: str) -> None:
-    st.session_state["_nav_to"] = page
+def is_datetime_like(series: pd.Series) -> bool:
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return True
+    if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+        sample = series.dropna().astype(str).head(200)
+        if sample.empty:
+            return False
+        converted = pd.to_datetime(sample, errors="coerce")
+        ratio = converted.notna().mean()
+        return ratio >= 0.8
+    return False
 
+def expand_datetime_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    out = df.copy()
+    expanded = []
+    for col in list(out.columns):
+        s = out[col]
+        if is_datetime_like(s):
+            dt = pd.to_datetime(s, errors="coerce")
+            if dt.notna().sum() == 0:
+                continue
+            out[f"{col}__year"] = dt.dt.year
+            out[f"{col}__month"] = dt.dt.month
+            out[f"{col}__day"] = dt.dt.day
+            out[f"{col}__dayofweek"] = dt.dt.dayofweek
+            out[f"{col}__hour"] = dt.dt.hour
+            out[f"{col}__is_month_end"] = dt.dt.is_month_end.astype("float64")
+            out[f"{col}__is_month_start"] = dt.dt.is_month_start.astype("float64")
+            out.drop(columns=[col], inplace=True)
+            expanded.append(col)
+    return out, expanded
 
-def goto(page: str) -> None:
-    st.query_params["page"] = page
-    st.rerun()
-
-
-def apply_pending_nav() -> None:
-    nav_to = st.session_state.pop("_nav_to", None)
-    if nav_to:
-        goto(nav_to)
-
-
-# ============================================================
-# Shared task inference
-# ============================================================
 def infer_task(y: pd.Series) -> str:
-    y_no_na = y.dropna()
-    if y_no_na.empty:
-        return "unknown"
-
-    if not pd.api.types.is_numeric_dtype(y_no_na):
+    if y is None:
+        return "regression"
+    if not pd.api.types.is_numeric_dtype(y):
         return "classification"
-
-    n = len(y_no_na)
-    nunique = int(y_no_na.nunique(dropna=True))
-    unique_ratio = nunique / max(1, n)
-
-    is_integer_like = pd.api.types.is_integer_dtype(y_no_na) or np.allclose(
-        y_no_na.astype(float).values, np.round(y_no_na.astype(float).values), atol=1e-9
-    )
-
-    if is_integer_like and nunique <= 20 and unique_ratio <= 0.2:
+    y_nonnull = y.dropna()
+    if y_nonnull.empty:
+        return "regression"
+    unique_count = y_nonnull.nunique()
+    ratio = unique_count / max(len(y_nonnull), 1)
+    integer_like = np.allclose(y_nonnull, np.round(y_nonnull), equal_nan=True)
+    if integer_like and unique_count <= 20 and ratio <= 0.2:
         return "classification"
-
     return "regression"
 
+def mape_safe(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    denom = np.where(np.abs(y_true) < 1e-8, np.nan, np.abs(y_true))
+    mape = np.abs((y_true - y_pred) / denom) * 100.0
+    return float(np.nanmean(mape))
 
-def _expand_datetime_features(X: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert datetime columns into numeric features to avoid one-hot explosion.
-    - If a column is datetime dtype -> expand.
-    - If an object column looks like datetime (parsable) -> expand.
-    """
-    X = X.copy()
+def get_feature_schema(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    schema = {}
+    for col in df.columns:
+        s = df[col]
+        dtype_str = str(s.dtype)
+        entry = {
+            "dtype": dtype_str,
+            "is_numeric": bool(pd.api.types.is_numeric_dtype(s)),
+            "is_bool": bool(pd.api.types.is_bool_dtype(s)),
+            "example": None if s.dropna().empty else str(s.dropna().iloc[0]),
+            "categories": None,
+        }
+        if not entry["is_numeric"]:
+            cats = s.dropna().astype(str).value_counts().head(30).index.tolist()
+            entry["categories"] = cats
+        schema[col] = entry
+    return schema
 
-    def add_parts(colname: str, dt: pd.Series):
-        X[f"{colname}__year"] = dt.dt.year
-        X[f"{colname}__month"] = dt.dt.month
-        X[f"{colname}__day"] = dt.dt.day
-        X[f"{colname}__dayofweek"] = dt.dt.dayofweek
-        X[f"{colname}__hour"] = dt.dt.hour
+def ensure_feature_frame(df: pd.DataFrame, required_columns: List[str]) -> pd.DataFrame:
+    out = df.copy()
+    for col in required_columns:
+        if col not in out.columns:
+            out[col] = np.nan
+    out = out[required_columns]
+    return out
 
-    dt_cols = X.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns.tolist()
-    for c in dt_cols:
-        dt = pd.to_datetime(X[c], errors="coerce")
-        add_parts(c, dt)
-        X.drop(columns=[c], inplace=True)
+def json_default(obj):
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.ndarray,)):
+        return obj.tolist()
+    if isinstance(obj, (pd.Timestamp, datetime)):
+        return obj.isoformat()
+    return str(obj)
 
-    obj_cols = X.select_dtypes(include=["object"]).columns.tolist()
-    for c in obj_cols:
-        s = X[c]
-        sample = s.dropna().astype(str).head(50)
-        if sample.empty:
-            continue
-        parsed = pd.to_datetime(sample, errors="coerce", infer_datetime_format=True)
-        if parsed.notna().mean() >= 0.8:
-            full = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
-            add_parts(c, full)
-            X.drop(columns=[c], inplace=True)
+# ----------------------------- #
+# Data preparation and training
+# ----------------------------- #
+def build_preprocessor(X: pd.DataFrame):
+    num_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
+    cat_cols = [c for c in X.columns if c not in num_cols]
 
-    return X
-
-
-# ============================================================
-# ANN BACKEND
-# ============================================================
-def _make_preprocessor(X: pd.DataFrame):
-    sk = _get_sklearn()
-    ColumnTransformer = sk["ColumnTransformer"]
-    OneHotEncoder = sk["OneHotEncoder"]
-    StandardScaler = sk["StandardScaler"]
-    Pipeline = sk["Pipeline"]
-    SimpleImputer = sk["SimpleImputer"]
-
-    numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-    categorical_cols = [c for c in X.columns if c not in numeric_cols]
-
-    num_pipe = Pipeline(
-        [
+    numeric_pipe = Pipeline(
+        steps=[
             ("imputer", SimpleImputer(strategy="median")),
             ("scaler", StandardScaler()),
         ]
@@ -280,8 +344,8 @@ def _make_preprocessor(X: pd.DataFrame):
     except TypeError:
         ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
 
-    cat_pipe = Pipeline(
-        [
+    categorical_pipe = Pipeline(
+        steps=[
             ("imputer", SimpleImputer(strategy="most_frequent")),
             ("onehot", ohe),
         ]
@@ -289,3441 +353,4805 @@ def _make_preprocessor(X: pd.DataFrame):
 
     preprocessor = ColumnTransformer(
         transformers=[
-            ("num", num_pipe, numeric_cols),
-            ("cat", cat_pipe, categorical_cols),
+            ("num", numeric_pipe, num_cols),
+            ("cat", categorical_pipe, cat_cols),
         ],
         remainder="drop",
     )
-    return preprocessor, numeric_cols, categorical_cols
+    return preprocessor, num_cols, cat_cols
 
+def prepare_dataset(df: pd.DataFrame, config: Dict[str, Any]) -> Dict[str, Any]:
+    if df is None or df.empty:
+        raise ValueError("No dataset loaded.")
 
-def _map_activation(name: str) -> str:
-    name = (name or "").strip().lower()
-    if name in ["relu", "re-lu"]:
-        return "relu"
-    if name == "tanh":
-        return "tanh"
-    if name == "sigmoid":
-        return "sigmoid"
-    return "relu"
+    work_df = df.copy()
 
+    if config["drop_duplicates"]:
+        work_df = work_df.drop_duplicates().reset_index(drop=True)
 
-def _build_ann_model(
-    input_dim: int,
-    task: str,
-    n_classes: int,
-    ann_config: Optional[Dict[str, Any]],
-    lr: float,
-):
-    tf, layers, _, _ = _get_tf_keras()
+    if config["target_column"] is None or config["target_column"] not in work_df.columns:
+        raise ValueError("Choose a valid target column in Preprocess.")
 
-    ann_config = ann_config or {}
-    hidden_layers = _clamp_int(ann_config.get("hidden_layers", 3), 1, 12, 3)
+    target_col = config["target_column"]
 
-    neurons = ann_config.get("neurons", [256, 128, 64])
-    if not isinstance(neurons, list):
-        neurons = [256, 128, 64]
-    neurons = (neurons + [64] * hidden_layers)[:hidden_layers]
-    neurons = [max(1, int(n)) for n in neurons]
+    # Drop rows with missing target
+    work_df = work_df.loc[work_df[target_col].notna()].copy()
+    if len(work_df) < 10:
+        raise ValueError("Dataset is too small after removing rows with missing target.")
 
-    act = _map_activation(ann_config.get("activation", "ReLU"))
-    out_choice = (ann_config.get("output_activation", "Auto") or "Auto").strip().lower()
+    drop_cols = [c for c in config["drop_columns"] if c in work_df.columns and c != target_col]
+    if drop_cols:
+        work_df = work_df.drop(columns=drop_cols)
 
-    model = tf.keras.Sequential()
-    model.add(layers.Input(shape=(input_dim,)))
+    # Feature selection
+    feature_cols = config["feature_columns"]
+    if not feature_cols:
+        feature_cols = [c for c in work_df.columns if c != target_col]
+    feature_cols = [c for c in feature_cols if c in work_df.columns and c != target_col]
+    if not feature_cols:
+        raise ValueError("No valid feature columns selected.")
 
-    for n in neurons:
-        model.add(layers.Dense(n, activation=act))
-        model.add(layers.Dropout(0.2))
+    X_raw = work_df[feature_cols].copy()
+    y_raw = work_df[target_col].copy()
 
-    optimizer = tf.keras.optimizers.Adam(learning_rate=float(lr))
+    datetime_expanded = []
+    if config["auto_datetime"]:
+        X_raw, datetime_expanded = expand_datetime_columns(X_raw)
+
+    task = infer_task(y_raw) if config["task_mode"] == "Auto Detect" else config["task_mode"].lower()
+    if task not in {"classification", "regression"}:
+        task = "regression"
+
+    preprocessor, num_cols, cat_cols = build_preprocessor(X_raw)
+
+    if task == "classification":
+        y_raw = y_raw.astype(str)
+        label_encoder = LabelEncoder()
+        y = label_encoder.fit_transform(y_raw)
+        class_names = label_encoder.classes_.tolist()
+        stratify = y if len(np.unique(y)) > 1 and min(pd.Series(y).value_counts()) >= 2 else None
+    else:
+        label_encoder = None
+        class_names = None
+        y = pd.to_numeric(y_raw, errors="coerce").astype(float).values
+        valid = ~np.isnan(y)
+        X_raw = X_raw.loc[valid].reset_index(drop=True)
+        y = y[valid]
+        stratify = None
+
+    if len(X_raw) < 10:
+        raise ValueError("Not enough valid rows to continue.")
+
+    X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+        X_raw,
+        y,
+        test_size=float(config["test_size"]),
+        random_state=int(config["random_seed"]),
+        shuffle=bool(config["shuffle_data"]),
+        stratify=stratify,
+    )
+
+    X_train = preprocessor.fit_transform(X_train_raw)
+    X_test = preprocessor.transform(X_test_raw)
+
+    try:
+        feature_names = preprocessor.get_feature_names_out().tolist()
+    except Exception:
+        feature_names = [f"f_{i}" for i in range(X_train.shape[1])]
+
+    class_weights = None
+    if task == "classification" and config.get("use_class_weights", True):
+        classes = np.unique(y_train)
+        weights = compute_class_weight(class_weight="balanced", classes=classes, y=y_train)
+        class_weights = {int(c): float(w) for c, w in zip(classes, weights)}
+
+    return {
+        "df_used": work_df,
+        "task": task,
+        "target_column": target_col,
+        "feature_columns_original": feature_cols,
+        "feature_columns_after_datetime": X_raw.columns.tolist(),
+        "datetime_expanded_columns": datetime_expanded,
+        "feature_schema": get_feature_schema(work_df[feature_cols]),
+        "num_cols": num_cols,
+        "cat_cols": cat_cols,
+        "preprocessor": preprocessor,
+        "label_encoder": label_encoder,
+        "class_names": class_names,
+        "X_train": np.asarray(X_train).astype("float32"),
+        "X_test": np.asarray(X_test).astype("float32"),
+        "X_train_raw": X_train_raw.reset_index(drop=True),
+        "X_test_raw": X_test_raw.reset_index(drop=True),
+        "y_train": np.asarray(y_train),
+        "y_test": np.asarray(y_test),
+        "feature_names": feature_names,
+        "class_weights": class_weights,
+    }
+
+def build_model(input_dim: int, task: str, config: Dict[str, Any], n_classes: int = 1):
+    tf = get_tf()
+    layers = parse_hidden_layers(config["hidden_layers"])
+    reg = tf.keras.regularizers.l2(float(config["l2_reg"])) if float(config["l2_reg"]) > 0 else None
+
+    model = tf.keras.Sequential(name="oil_gas_ann")
+    model.add(tf.keras.layers.Input(shape=(input_dim,)))
+
+    for units in layers:
+        model.add(tf.keras.layers.Dense(units, activation=None, kernel_regularizer=reg))
+        if config.get("batch_norm", True):
+            model.add(tf.keras.layers.BatchNormalization())
+        model.add(tf.keras.layers.Activation(config["activation"]))
+        if float(config["dropout"]) > 0:
+            model.add(tf.keras.layers.Dropout(float(config["dropout"])))
 
     if task == "classification":
         if n_classes == 2:
-            out_units = 1
-            default_out_act = "sigmoid"
+            model.add(tf.keras.layers.Dense(1, activation="sigmoid"))
             loss = "binary_crossentropy"
+            metrics = [
+                tf.keras.metrics.BinaryAccuracy(name="accuracy"),
+                tf.keras.metrics.Precision(name="precision"),
+                tf.keras.metrics.Recall(name="recall"),
+                tf.keras.metrics.AUC(name="auc"),
+            ]
         else:
-            out_units = n_classes
-            default_out_act = "softmax"
+            model.add(tf.keras.layers.Dense(n_classes, activation="softmax"))
             loss = "sparse_categorical_crossentropy"
-
-        out_act = default_out_act
-        if out_choice in ["sigmoid", "softmax", "linear"]:
-            out_act = out_choice
-
-        model.add(layers.Dense(out_units, activation=out_act))
-        model.compile(optimizer=optimizer, loss=loss, metrics=["accuracy"])
+            metrics = [
+                tf.keras.metrics.SparseCategoricalAccuracy(name="accuracy"),
+            ]
     else:
-        model.add(layers.Dense(1, activation="linear"))
-        model.compile(optimizer=optimizer, loss="mse")
+        model.add(tf.keras.layers.Dense(1, activation="linear"))
+        loss = "mse"
+        metrics = [
+            tf.keras.metrics.RootMeanSquaredError(name="rmse"),
+            tf.keras.metrics.MeanAbsoluteError(name="mae"),
+        ]
 
+    opt_name = config["optimizer"].lower()
+    lr = float(config["learning_rate"])
+    if opt_name == "adam":
+        optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+    elif opt_name == "sgd":
+        optimizer = tf.keras.optimizers.SGD(learning_rate=lr, momentum=0.9)
+    elif opt_name == "rmsprop":
+        optimizer = tf.keras.optimizers.RMSprop(learning_rate=lr)
+    else:
+        optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+
+    model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
     return model
 
+class StreamlitProgressCallback:
+    def __init__(self, progress_bar, info_box, total_epochs):
+        self.progress_bar = progress_bar
+        self.info_box = info_box
+        self.total_epochs = max(1, int(total_epochs))
 
-def train_ann_from_df(
-    df: pd.DataFrame,
-    target_col: str,
-    feature_cols: List[str],
-    task_choice: str = "auto",
-    test_size: float = 0.2,
-    epochs: int = 30,
-    batch_size: int = 32,
-    lr: float = 0.001,
-    early_stop: bool = True,
-    patience: int = 5,
-    seed: int = 42,
-    ann_config: Optional[Dict[str, Any]] = None,
-):
-    sk = _get_sklearn()
-    train_test_split = sk["train_test_split"]
-    LabelEncoder = sk["LabelEncoder"]
-    accuracy_score = sk["accuracy_score"]
-    precision_score = sk["precision_score"]
-    recall_score = sk["recall_score"]
-    f1_score = sk["f1_score"]
-    confusion_matrix = sk["confusion_matrix"]
-    mean_absolute_error = sk["mean_absolute_error"]
-    mean_squared_error = sk["mean_squared_error"]
-    r2_score = sk["r2_score"]
+    def as_callback(self):
+        tf = get_tf()
+        outer = self
 
-    tf = _get_tf()
+        class _CB(tf.keras.callbacks.Callback):
+            def on_epoch_end(self, epoch, logs=None):
+                logs = logs or {}
+                frac = (epoch + 1) / outer.total_epochs
+                outer.progress_bar.progress(min(frac, 1.0))
+                txt = [f"Epoch {epoch + 1}/{outer.total_epochs}"]
+                for k, v in logs.items():
+                    try:
+                        txt.append(f"{k}: {float(v):.4f}")
+                    except Exception:
+                        pass
+                outer.info_box.markdown(" | ".join(txt))
+        return _CB()
 
-    df = df.dropna(axis=1, how="all").dropna(axis=0, how="all").copy()
+def train_model(prepared: Dict[str, Any], config: Dict[str, Any]):
+    set_seed(int(config["random_seed"]))
+    tf = get_tf()
 
-    if target_col not in df.columns:
-        raise ValueError(f"Target column not found: {target_col}")
-    for c in feature_cols:
-        if c not in df.columns:
-            raise ValueError(f"Feature column not found: {c}")
+    task = prepared["task"]
+    X_train = prepared["X_train"]
+    y_train = prepared["y_train"]
+    X_test = prepared["X_test"]
+    y_test = prepared["y_test"]
+    class_names = prepared["class_names"] or []
 
-    X = df[feature_cols].copy()
-    y = df[target_col].copy()
-
-    X = _expand_datetime_features(X)
-
-    task = infer_task(y) if task_choice == "auto" else task_choice
-    if task == "unknown":
-        raise ValueError("Target column is empty after removing NA.")
-
-    label_encoder: Optional[Any] = None
-
-    if task == "classification":
-        label_encoder = LabelEncoder()
-        y_enc = label_encoder.fit_transform(y.astype(str).fillna("NA"))
-        n_classes = int(len(label_encoder.classes_))
-        if n_classes < 2:
-            raise ValueError("Classification requires at least 2 classes in target.")
-
-        stratify = y_enc if n_classes >= 2 else None
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y_enc, test_size=test_size, random_state=seed, shuffle=True, stratify=stratify
-        )
-    else:
-        y_enc = pd.to_numeric(y, errors="coerce").astype(float).values
-        keep = ~np.isnan(y_enc)
-        X = X.loc[keep].reset_index(drop=True)
-        y_enc = y_enc[keep]
-        if len(y_enc) < 2:
-            raise ValueError("Regression has too few usable numeric rows after cleaning.")
-        n_classes = 1
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y_enc, test_size=test_size, random_state=seed, shuffle=True
-        )
-
-    preprocessor, numeric_cols, categorical_cols = _make_preprocessor(X)
-
-    X_train_np = preprocessor.fit_transform(X_train)
-    X_test_np = preprocessor.transform(X_test)
-    if X_train_np.shape[1] < 1:
-        raise ValueError("After preprocessing, there are 0 usable input features.")
-
-    model = _build_ann_model(
-        input_dim=int(X_train_np.shape[1]),
-        task=task,
-        n_classes=int(n_classes),
-        ann_config=ann_config,
-        lr=float(lr),
-    )
+    n_classes = len(class_names) if task == "classification" else 1
+    model = build_model(X_train.shape[1], task, config, n_classes=n_classes)
 
     callbacks = []
-    if early_stop:
+    progress = st.progress(0)
+    info_box = st.empty()
+    callbacks.append(StreamlitProgressCallback(progress, info_box, config["epochs"]).as_callback())
+
+    if config["early_stopping"]:
         callbacks.append(
-            tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=patience, restore_best_weights=True)
+            tf.keras.callbacks.EarlyStopping(
+                monitor="val_loss",
+                patience=int(config["patience"]),
+                restore_best_weights=True,
+            )
         )
 
-    history_obj = model.fit(
-        X_train_np,
+    history = model.fit(
+        X_train,
         y_train,
-        validation_split=0.2,
-        epochs=epochs,
-        batch_size=batch_size,
+        validation_split=float(config["validation_split"]),
+        epochs=int(config["epochs"]),
+        batch_size=int(config["batch_size"]),
         verbose=0,
         callbacks=callbacks,
+        class_weight=prepared["class_weights"],
     )
-    history = history_obj.history
 
-    results: Dict[str, Any] = {
-        "task": task,
-        "n_features_after_encoding": int(X_train_np.shape[1]),
-        "numeric_features": int(len(numeric_cols)),
-        "categorical_features": int(len(categorical_cols)),
-    }
-
+    # Predictions
     if task == "classification":
-        probs = model.predict(X_test_np, verbose=0)
+        proba = model.predict(X_test, verbose=0)
         if n_classes == 2:
-            y_score = probs.reshape(-1).astype(float)
-            y_pred = (y_score > 0.5).astype(int)
+            y_score = proba.reshape(-1)
+            threshold = float(config["threshold"])
+            y_pred = (y_score >= threshold).astype(int)
+            y_prob_full = np.column_stack([1 - y_score, y_score])
         else:
-            y_pred = np.argmax(probs, axis=1).astype(int)
+            y_prob_full = proba
+            y_pred = np.argmax(proba, axis=1)
             y_score = None
 
-        results.update(
-            {
-                "accuracy": float(accuracy_score(y_test, y_pred)),
-                "precision": float(precision_score(y_test, y_pred, average="weighted", zero_division=0)),
-                "recall": float(recall_score(y_test, y_pred, average="weighted", zero_division=0)),
-                "f1_score": float(f1_score(y_test, y_pred, average="weighted", zero_division=0)),
-                "confusion_matrix": confusion_matrix(y_test, y_pred).tolist(),
-                "classes": int(n_classes),
-                "class_labels": label_encoder.classes_.tolist() if label_encoder is not None else None,
-            }
-        )
-
-        # Store ROC/PR data (binary)
-        results["y_true"] = y_test.tolist()
+        metrics = {
+            "accuracy": float(accuracy_score(y_test, y_pred)),
+            "precision_weighted": float(precision_score(y_test, y_pred, average="weighted", zero_division=0)),
+            "recall_weighted": float(recall_score(y_test, y_pred, average="weighted", zero_division=0)),
+            "f1_weighted": float(f1_score(y_test, y_pred, average="weighted", zero_division=0)),
+        }
         if n_classes == 2 and y_score is not None:
-            results["y_score"] = y_score.tolist()
-        else:
-            results["y_score"] = None
+            try:
+                metrics["roc_auc"] = float(roc_auc_score(y_test, y_score))
+            except Exception:
+                pass
+
+        results = {
+            "task": task,
+            "metrics": metrics,
+            "y_true": y_test,
+            "y_pred": y_pred,
+            "y_prob": y_prob_full,
+            "y_score": y_score,
+            "class_names": class_names,
+            "classification_report": classification_report(
+                y_test, y_pred, target_names=class_names, output_dict=True, zero_division=0
+            ),
+        }
     else:
-        preds = model.predict(X_test_np, verbose=0).reshape(-1)
-        results.update(
-            {
-                "mae": float(mean_absolute_error(y_test, preds)),
-                "rmse": float(np.sqrt(mean_squared_error(y_test, preds))),
-                "r2_score": float(r2_score(y_test, preds)) if len(y_test) >= 2 else 0.0,
-            }
-        )
+        y_pred = model.predict(X_test, verbose=0).reshape(-1)
+        metrics = {
+            "mae": float(mean_absolute_error(y_test, y_pred)),
+            "rmse": float(np.sqrt(mean_squared_error(y_test, y_pred))),
+            "r2": float(r2_score(y_test, y_pred)),
+            "mape": float(mape_safe(y_test, y_pred)),
+        }
+        results = {
+            "task": task,
+            "metrics": metrics,
+            "y_true": y_test,
+            "y_pred": y_pred,
+            "residuals": y_test - y_pred,
+        }
 
-    return model, preprocessor, label_encoder, results, {
-        "loss": [float(x) for x in history.get("loss", [])],
-        "val_loss": [float(x) for x in history.get("val_loss", [])],
-    }
+    progress.progress(1.0)
+    info_box.success("Training finished.")
+    return model, history.history, results
 
+def predict_with_pipeline(model, prepared: Dict[str, Any], input_df: pd.DataFrame, threshold: float = 0.5) -> pd.DataFrame:
+    feature_cols = prepared["feature_columns_original"]
+    raw = ensure_feature_frame(input_df, feature_cols)
+    if prepared["datetime_expanded_columns"]:
+        raw, _ = expand_datetime_columns(raw)
 
-def predict_from_df(
-    df_features: pd.DataFrame,
-    model,
-    preprocessor,
-    task: str,
-    label_encoder: Optional[Any] = None,
-    threshold: float = 0.5,
-) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    X = _expand_datetime_features(df_features)
-    X_np = preprocessor.transform(X)
+    # Align to training-time columns after datetime expansion
+    required_after_dt = prepared["feature_columns_after_datetime"]
+    raw = ensure_feature_frame(raw, required_after_dt)
+
+    X = prepared["preprocessor"].transform(raw)
+    X = np.asarray(X).astype("float32")
+
+    task = prepared["task"]
+    out = input_df.copy()
 
     if task == "classification":
-        probs = model.predict(X_np, verbose=0)
-        if probs.ndim == 2 and probs.shape[1] > 1:
-            pred_idx = np.argmax(probs, axis=1).astype(int)
-            conf = np.max(probs, axis=1).astype(float)
+        class_names = prepared["class_names"]
+        proba = model.predict(X, verbose=0)
+        if len(class_names) == 2:
+            score = proba.reshape(-1)
+            pred = (score >= threshold).astype(int)
+            labels = [class_names[i] for i in pred]
+            out["prediction"] = labels
+            out["prediction_score_positive"] = score
+            out[f"prob_{class_names[0]}"] = 1 - score
+            out[f"prob_{class_names[1]}"] = score
         else:
-            p = probs.reshape(-1).astype(float)
-            pred_idx = (p >= float(threshold)).astype(int)
-            conf = p
+            pred = np.argmax(proba, axis=1)
+            labels = [class_names[i] for i in pred]
+            out["prediction"] = labels
+            for i, cls in enumerate(class_names):
+                out[f"prob_{cls}"] = proba[:, i]
+    else:
+        pred = model.predict(X, verbose=0).reshape(-1)
+        out["prediction"] = pred
 
-        if label_encoder is not None:
-            decoded = label_encoder.inverse_transform(pred_idx.astype(int))
-            return decoded, conf
-        return pred_idx, conf
+    return out
 
-    preds = model.predict(X_np, verbose=0).reshape(-1)
-    return preds, None
+# ----------------------------- #
+# Serialization
+# ----------------------------- #
+def create_project_bundle_bytes() -> bytes:
+    if st.session_state.trained_model is None or st.session_state.prepared_data is None:
+        raise ValueError("Train or load a project first.")
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    project_name = safe_filename(st.session_state.config["project_name"])
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        model_path = tmp / "model.keras"
+        bundle_path = tmp / "bundle.joblib"
+        meta_path = tmp / "meta.json"
+
+        st.session_state.trained_model.save(model_path)
+
+        bundle = {
+            "raw_df": st.session_state.raw_df,
+            "config": st.session_state.config,
+            "prepared_data": st.session_state.prepared_data,
+            "training_history": st.session_state.training_history,
+            "results": st.session_state.results,
+        }
+        joblib.dump(bundle, bundle_path)
+
+        meta = {
+            "project_name": project_name,
+            "saved_at": datetime.now().isoformat(),
+            "task": st.session_state.results.get("task"),
+            "target_column": st.session_state.config.get("target_column"),
+        }
+        meta_path.write_text(json.dumps(meta, indent=2, default=json_default), encoding="utf-8")
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.write(model_path, arcname="model.keras")
+            zf.write(bundle_path, arcname="bundle.joblib")
+            zf.write(meta_path, arcname="meta.json")
+        return buffer.getvalue()
+
+def save_project_locally():
+    data = create_project_bundle_bytes()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    project_name = safe_filename(st.session_state.config["project_name"])
+    path = PROJECTS_DIR / f"{project_name}_{ts}.zip"
+    path.write_bytes(data)
+    return path
+
+def load_project_from_zip_bytes(zip_bytes: bytes):
+    tf = get_tf()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        zip_path = tmp / "project.zip"
+        zip_path.write_bytes(zip_bytes)
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(tmp)
+
+        model_path = tmp / "model.keras"
+        bundle_path = tmp / "bundle.joblib"
+
+        model = tf.keras.models.load_model(model_path)
+        bundle = joblib.load(bundle_path)
+
+    st.session_state.raw_df = bundle["raw_df"]
+    st.session_state.config = bundle["config"]
+    st.session_state.prepared_data = bundle["prepared_data"]
+    st.session_state.training_history = bundle["training_history"]
+    st.session_state.results = bundle["results"]
+    st.session_state.trained_model = model
+    st.session_state.loaded_project_name = bundle["config"].get("project_name", "loaded_project")
+    return bundle
+
+# ----------------------------- #
+# Visualization helpers
+# ----------------------------- #
+def plot_training_curves(history: Dict[str, List[float]]):
+    if not history:
+        st.info("No training history available yet.")
+        return
+    plt = get_plt()
+    base_metrics = ["loss"] + sorted({
+        (k[4:] if k.startswith("val_") else k)
+        for k in history.keys()
+        if k != "val_loss" and not k.startswith("val_val_")
+    } - {"loss"})
+    for metric in base_metrics:
+        fig, ax = plt.subplots(figsize=(11.2, 4.8))
+        ax.plot(history.get(metric, []), label=metric)
+        if metric == "loss" and "val_loss" in history:
+            ax.plot(history.get("val_loss", []), label="val_loss")
+        elif f"val_{metric}" in history:
+            ax.plot(history.get(f"val_{metric}", []), label=f"val_{metric}")
+        ax.set_title(f"Training Curve - {metric}")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(metric)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        st.pyplot(fig, clear_figure=True, use_container_width=True)
+
+def plot_confusion(y_true, y_pred, class_names):
+    plt = get_plt()
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(figsize=(9.6, 7.4))
+    im = ax.imshow(cm, aspect="auto")
+    plt.colorbar(im, ax=ax)
+    ax.set_title("Confusion Matrix")
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
+    ax.set_xticks(range(len(class_names)))
+    ax.set_xticklabels(class_names, rotation=45, ha="right")
+    ax.set_yticks(range(len(class_names)))
+    ax.set_yticklabels(class_names)
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, str(cm[i, j]), ha="center", va="center")
+    st.pyplot(fig, clear_figure=True, use_container_width=True)
+
+def plot_binary_curves(y_true, y_score):
+    if y_score is None:
+        return
+    plt = get_plt()
+
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    fig1, ax1 = plt.subplots(figsize=(9.2, 4.9))
+    ax1.plot(fpr, tpr)
+    ax1.plot([0, 1], [0, 1], linestyle="--")
+    ax1.set_title("ROC Curve")
+    ax1.set_xlabel("False Positive Rate")
+    ax1.set_ylabel("True Positive Rate")
+    ax1.grid(True, alpha=0.3)
+    st.pyplot(fig1, clear_figure=True, use_container_width=True)
+
+    precision, recall, _ = precision_recall_curve(y_true, y_score)
+    fig2, ax2 = plt.subplots(figsize=(9.2, 5.0))
+    ax2.plot(recall, precision)
+    ax2.set_title("Precision-Recall Curve")
+    ax2.set_xlabel("Recall")
+    ax2.set_ylabel("Precision")
+    ax2.grid(True, alpha=0.3)
+    st.pyplot(fig2, clear_figure=True, use_container_width=True)
+
+def plot_regression_results(y_true, y_pred):
+    plt = get_plt()
+    residuals = y_true - y_pred
+
+    fig1, ax1 = plt.subplots(figsize=(9.4, 6.2))
+    ax1.scatter(y_true, y_pred, alpha=0.65)
+    mn = float(min(np.min(y_true), np.min(y_pred)))
+    mx = float(max(np.max(y_true), np.max(y_pred)))
+    ax1.plot([mn, mx], [mn, mx], linestyle="--")
+    ax1.set_title("Actual vs Predicted")
+    ax1.set_xlabel("Actual")
+    ax1.set_ylabel("Predicted")
+    ax1.grid(True, alpha=0.3)
+    st.pyplot(fig1, clear_figure=True, use_container_width=True)
+
+    fig2, ax2 = plt.subplots(figsize=(9.2, 5.0))
+    ax2.scatter(y_pred, residuals, alpha=0.65)
+    ax2.axhline(0.0, linestyle="--")
+    std = np.std(residuals)
+    ax2.axhline(2 * std, linestyle=":")
+    ax2.axhline(-2 * std, linestyle=":")
+    ax2.set_title("Residuals vs Predicted")
+    ax2.set_xlabel("Predicted")
+    ax2.set_ylabel("Residual")
+    ax2.grid(True, alpha=0.3)
+    st.pyplot(fig2, clear_figure=True, use_container_width=True)
+
+    fig3, ax3 = plt.subplots(figsize=(9.2, 4.9))
+    ax3.hist(residuals, bins=30)
+    ax3.set_title("Residual Histogram")
+    ax3.set_xlabel("Residual")
+    ax3.set_ylabel("Frequency")
+    ax3.grid(True, alpha=0.3)
+    st.pyplot(fig3, clear_figure=True, use_container_width=True)
+
+    n = min(len(y_true), 300)
+    fig4, ax4 = plt.subplots(figsize=(11.2, 4.8))
+    ax4.plot(np.arange(n), y_true[:n], label="Actual")
+    ax4.plot(np.arange(n), y_pred[:n], label="Predicted")
+    ax4.set_title("Actual vs Predicted Trend (first 300 test samples)")
+    ax4.set_xlabel("Sample Index")
+    ax4.set_ylabel("Target")
+    ax4.legend(loc="upper right")
+    ax4.grid(True, alpha=0.3)
+    st.pyplot(fig4, clear_figure=True, use_container_width=True)
+
+def plot_data_profile(df: pd.DataFrame, target_col: Optional[str]):
+    plt = get_plt()
+    if df is None or df.empty:
+        st.info("Upload a dataset first.")
+        return
+
+    st.subheader("Uploaded Data Preview")
+    st.dataframe(df.head(10), use_container_width=True, height=320)
+
+    st.subheader("Column Summary")
+    info = pd.DataFrame({
+        "column": df.columns,
+        "dtype": [str(df[c].dtype) for c in df.columns],
+        "missing": [int(df[c].isna().sum()) for c in df.columns],
+        "nunique": [int(df[c].nunique(dropna=True)) for c in df.columns],
+    })
+    st.dataframe(info, use_container_width=True, height=320)
+
+    if target_col and target_col in df.columns:
+        st.subheader("Target Preview")
+        plot_col, _ = st.columns(2)
+        with plot_col:
+            if infer_task(df[target_col]) == "classification":
+                counts = df[target_col].astype(str).value_counts().head(25)
+                fig, ax = plt.subplots(figsize=(7.0, 3.8))
+                ax.bar(counts.index.astype(str), counts.values)
+                ax.set_title("Target Class Distribution")
+                ax.set_xlabel("Class")
+                ax.set_ylabel("Count")
+                ax.tick_params(axis="x", rotation=45)
+                st.pyplot(fig, clear_figure=True, use_container_width=True)
+            else:
+                fig, ax = plt.subplots(figsize=(7.0, 3.8))
+                clean = pd.to_numeric(df[target_col], errors="coerce").dropna()
+                ax.hist(clean, bins=35)
+                ax.set_title("Target Histogram")
+                ax.set_xlabel(target_col)
+                ax.set_ylabel("Frequency")
+                st.pyplot(fig, clear_figure=True, use_container_width=True)
+
+def make_training_curve_fig(history: Dict[str, List[float]], metric: str):
+    plt = get_plt()
+    fig, ax = plt.subplots(figsize=(7.0, 3.6))
+    ax.plot(history.get(metric, []), label=metric)
+    if metric == "loss" and "val_loss" in history:
+        ax.plot(history.get("val_loss", []), label="val_loss")
+    elif f"val_{metric}" in history:
+        ax.plot(history.get(f"val_{metric}", []), label=f"val_{metric}")
+    ax.set_title(f"Training Curve - {metric}")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(metric)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    return fig
 
 
-# ============================================================
-# LSTM BACKEND (Multivariate) — supports Regression + Classification
-# ============================================================
-def _clean_df_minimal(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
-    return df
+def make_confusion_fig(y_true, y_pred, class_names):
+    plt = get_plt()
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(figsize=(6.8, 5.2))
+    im = ax.imshow(cm, aspect="auto")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_title("Confusion Matrix")
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
+    ax.set_xticks(range(len(class_names)))
+    ax.set_xticklabels(class_names, rotation=35, ha="right")
+    ax.set_yticks(range(len(class_names)))
+    ax.set_yticklabels(class_names)
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, str(cm[i, j]), ha="center", va="center", fontsize=10)
+    return fig
 
 
-def _smart_split_sizes(n: int, test_size: float) -> Tuple[float, List[str]]:
-    warns: List[str] = []
-    test_size = float(test_size)
-    test_size = min(max(test_size, 0.05), 0.5)
+def make_binary_curve_figs(y_true, y_score):
+    if y_score is None:
+        return None, None
+    plt = get_plt()
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    fig1, ax1 = plt.subplots(figsize=(7.0, 3.8))
+    ax1.plot(fpr, tpr)
+    ax1.plot([0, 1], [0, 1], linestyle="--")
+    ax1.set_title("ROC Curve")
+    ax1.set_xlabel("False Positive Rate")
+    ax1.set_ylabel("True Positive Rate")
+    ax1.grid(True, alpha=0.3)
 
-    if n < 2:
-        return test_size, warns
-
-    test_count = int(np.ceil(n * test_size))
-    train_count = n - test_count
-    if train_count < 1:
-        test_count = n - 1
-        test_size = test_count / n
-        warns.append(f"Auto-adjusted test split because dataset is very small (n={n}).")
-    return test_size, warns
-
-
-@dataclass
-class LSTMConfig:
-    target_col: str
-    feature_cols: List[str]
-    date_col: Optional[str] = None
-
-    task: str = "auto"  # "auto" | "classification" | "regression"
-
-    lookback: int = 10
-    horizon: int = 1
-    test_size: float = 0.2
-
-    lstm_units: int = 64
-    dropout: float = 0.2
-    epochs: int = 100
-    batch_size: int = 32
-
-    patience: int = 10
-    val_split: float = 0.1
-    seed: int = 42
+    precision, recall, _ = precision_recall_curve(y_true, y_score)
+    fig2, ax2 = plt.subplots(figsize=(7.0, 3.8))
+    ax2.plot(recall, precision)
+    ax2.set_title("Precision-Recall Curve")
+    ax2.set_xlabel("Recall")
+    ax2.set_ylabel("Precision")
+    ax2.grid(True, alpha=0.3)
+    return fig1, fig2
 
 
-def _set_seed(seed: int) -> None:
-    tf = _get_tf()
+def make_predicted_distribution_fig(y_pred):
+    plt = get_plt()
+    fig, ax = plt.subplots(figsize=(7.0, 3.8))
+    pd.Series(y_pred).value_counts().sort_index().plot(kind="bar", ax=ax)
+    ax.set_title("Predicted Class Distribution")
+    ax.set_xlabel("Encoded Class")
+    ax.set_ylabel("Count")
+    ax.grid(True, alpha=0.2, axis="y")
+    return fig
+
+
+def make_regression_figures(y_true, y_pred):
+    plt = get_plt()
+    residuals = y_true - y_pred
+
+    fig1, ax1 = plt.subplots(figsize=(7.0, 4.1))
+    ax1.scatter(y_true, y_pred, alpha=0.65)
+    mn = float(min(np.min(y_true), np.min(y_pred)))
+    mx = float(max(np.max(y_true), np.max(y_pred)))
+    ax1.plot([mn, mx], [mn, mx], linestyle="--")
+    ax1.set_title("Actual vs Predicted")
+    ax1.set_xlabel("Actual")
+    ax1.set_ylabel("Predicted")
+    ax1.grid(True, alpha=0.3)
+
+    fig2, ax2 = plt.subplots(figsize=(7.0, 4.1))
+    ax2.scatter(y_pred, residuals, alpha=0.65)
+    ax2.axhline(0.0, linestyle="--")
+    std = np.std(residuals)
+    ax2.axhline(2 * std, linestyle=":")
+    ax2.axhline(-2 * std, linestyle=":")
+    ax2.set_title("Residuals vs Predicted")
+    ax2.set_xlabel("Predicted")
+    ax2.set_ylabel("Residual")
+    ax2.grid(True, alpha=0.3)
+
+    fig3, ax3 = plt.subplots(figsize=(7.0, 3.8))
+    ax3.hist(residuals, bins=30)
+    ax3.set_title("Residual Histogram")
+    ax3.set_xlabel("Residual")
+    ax3.set_ylabel("Frequency")
+    ax3.grid(True, alpha=0.3)
+
+    n = min(len(y_true), 300)
+    fig4, ax4 = plt.subplots(figsize=(7.0, 3.8))
+    ax4.plot(np.arange(n), y_true[:n], label="Actual")
+    ax4.plot(np.arange(n), y_pred[:n], label="Predicted")
+    ax4.set_title("Actual vs Predicted Trend")
+    ax4.set_xlabel("Sample Index")
+    ax4.set_ylabel("Target")
+    ax4.legend(loc="upper right")
+    ax4.grid(True, alpha=0.3)
+    return fig1, fig2, fig3, fig4
+
+# ----------------------------- #
+# Pages
+# ----------------------------- #
+def page_home():
+    hero()
+    cfg = st.session_state.config
+    df = st.session_state.raw_df
+    results = st.session_state.results
+
+    st.markdown(
+        """
+        <div class="section-note">
+        This app is built for tabular oil & gas problems such as production forecasting, pressure prediction,
+        water-cut estimation, drilling parameter optimization, artificial-lift performance, and equipment status classification.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows", 0 if df is None else len(df))
+    c2.metric("Columns", 0 if df is None else len(df.columns))
+    c3.metric("Target", cfg["target_column"] or "Not set")
+    c4.metric("Task", results.get("task", "Not trained"))
+
+    cols = st.columns(3)
+    steps = [
+        ("Data Upload", "Load CSV/XLSX oil & gas data and preview quality."),
+        ("Model", "Configure ANN architecture, training, optimizer, and stopping."),
+        ("Preprocess", "Choose target/features, auto-handle dates, missing data, scaling, and encoding."),
+        ("Train", "Train a feedforward neural network on the prepared dataset."),
+        ("Evaluate", "Inspect holdout metrics, error tables, and class/regression performance."),
+        ("Predict", "Run single-row or batch inference on new field data."),
+        ("Visualize", "Explore MATLAB-style plots: curves, confusion, residuals, ROC/PR, and trends."),
+        ("Save/Load", "Export the full project and reload later without retraining."),
+    ]
+    for idx, (title, desc) in enumerate(steps):
+        with cols[idx % 3]:
+            st.markdown(f'<div class="soft-card"><h4>{title}</h4><p class="tiny">{desc}</p></div>', unsafe_allow_html=True)
+
+    st.markdown("### Recommended oil & gas examples")
+    st.markdown(
+        """
+        - **Regression:** oil rate, gas rate, bottom-hole pressure, wellhead pressure, water cut, permeability proxy.
+        - **Classification:** equipment state, well status, formation class, artificial-lift fault class.
+        - **Typical inputs:** tubing pressure, choke size, temperature, gas-lift rate, depth, porosity, permeability, flowline pressure, date/time, well ID.
+        """
+    )
+
+def page_data_upload():
+    st.title("Data Upload")
+    st.caption("Load a CSV/XLSX file containing oil & gas tabular data.")
+    uploaded = st.file_uploader("Upload dataset", type=["csv", "xlsx", "xls"])
+    if uploaded is not None:
+        try:
+            df = read_uploaded_table(uploaded)
+            st.session_state.raw_df = df
+            if not st.session_state.config["feature_columns"]:
+                st.session_state.config["feature_columns"] = [c for c in df.columns]
+            st.success(f"Loaded {uploaded.name} successfully.")
+        except Exception as e:
+            st.error(f"Failed to load file: {e}")
+
+    df = st.session_state.raw_df
+    if df is None:
+        st.info("Upload a file to continue.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Rows", len(df))
+    c2.metric("Columns", len(df.columns))
+    c3.metric("Missing Cells", int(df.isna().sum().sum()))
+
+    plot_data_profile(df, st.session_state.config.get("target_column"))
+
+def page_model():
+    st.title("Model")
+    cfg = st.session_state.config
+
+    with st.form("model_form"):
+        left, right = st.columns(2)
+        with left:
+            cfg["project_name"] = st.text_input("Project Name", value=cfg["project_name"])
+            cfg["task_mode"] = st.selectbox("Task", ["Auto Detect", "Regression", "Classification"],
+                                            index=["Auto Detect", "Regression", "Classification"].index(cfg["task_mode"]))
+            cfg["hidden_layers"] = st.text_input("Hidden Layers (comma separated)", value=cfg["hidden_layers"])
+            cfg["activation"] = st.selectbox("Activation", ["relu", "tanh", "elu", "selu"],
+                                             index=["relu", "tanh", "elu", "selu"].index(cfg["activation"]))
+            cfg["dropout"] = st.slider("Dropout", 0.0, 0.7, float(cfg["dropout"]), 0.05)
+            cfg["batch_norm"] = st.checkbox("Use Batch Normalization", value=bool(cfg["batch_norm"]))
+            cfg["l2_reg"] = st.number_input("L2 Regularization", min_value=0.0, max_value=1.0,
+                                            value=float(cfg["l2_reg"]), step=0.0001, format="%.4f")
+        with right:
+            cfg["optimizer"] = st.selectbox("Optimizer", ["adam", "sgd", "rmsprop"],
+                                            index=["adam", "sgd", "rmsprop"].index(cfg["optimizer"]))
+            cfg["learning_rate"] = st.number_input("Learning Rate", min_value=1e-6, max_value=1.0,
+                                                   value=float(cfg["learning_rate"]), step=0.0001, format="%.6f")
+            cfg["epochs"] = st.number_input("Epochs", min_value=1, max_value=5000, value=int(cfg["epochs"]), step=1)
+            cfg["batch_size"] = st.number_input("Batch Size", min_value=1, max_value=2048, value=int(cfg["batch_size"]), step=1)
+            cfg["validation_split"] = st.slider("Validation Split", 0.05, 0.40, float(cfg["validation_split"]), 0.05)
+            cfg["early_stopping"] = st.checkbox("Early Stopping", value=bool(cfg["early_stopping"]))
+            cfg["patience"] = st.number_input("Patience", min_value=1, max_value=200, value=int(cfg["patience"]), step=1)
+            cfg["use_class_weights"] = st.checkbox("Use Class Weights (classification)", value=bool(cfg["use_class_weights"]))
+            cfg["threshold"] = st.slider("Binary Threshold", 0.05, 0.95, float(cfg["threshold"]), 0.01)
+        submitted = st.form_submit_button("Save Model Settings", use_container_width=True)
+
+    if submitted:
+        st.session_state.config = cfg
+        st.success("Model settings updated.")
+
+    st.markdown("### Current architecture preview")
+    layers = parse_hidden_layers(cfg["hidden_layers"])
+    st.code(f"Input -> " + " -> ".join([f"Dense({x})" for x in layers]) + " -> Output", language="text")
+
+def page_preprocess():
+    st.title("Preprocess")
+    df = st.session_state.raw_df
+    cfg = st.session_state.config
+
+    if df is None:
+        st.info("Upload a dataset first.")
+        return
+
+    cols = df.columns.tolist()
+    target_key = "__ann_preprocess_target"
+    feature_key = "__ann_preprocess_features"
+    drop_key = "__ann_preprocess_drop_columns"
+
+    if target_key not in st.session_state or st.session_state[target_key] not in cols:
+        st.session_state[target_key] = cfg["target_column"] if cfg["target_column"] in cols else cols[0]
+
+    current_target = st.selectbox("Target Column", cols, key=target_key)
+    available_cols = [c for c in cols if c != current_target]
+
+    if feature_key not in st.session_state:
+        default_features = [c for c in cfg["feature_columns"] if c in available_cols]
+        if not default_features:
+            default_features = available_cols.copy()
+        st.session_state[feature_key] = default_features
+    else:
+        st.session_state[feature_key] = [c for c in st.session_state[feature_key] if c in available_cols]
+        if not st.session_state[feature_key]:
+            st.session_state[feature_key] = available_cols.copy()
+
+    st.multiselect(
+        "Feature Columns",
+        available_cols,
+        key=feature_key,
+    )
+
+    if drop_key not in st.session_state:
+        st.session_state[drop_key] = [c for c in cfg["drop_columns"] if c in available_cols]
+    else:
+        st.session_state[drop_key] = [c for c in st.session_state[drop_key] if c in available_cols]
+
+    st.multiselect(
+        "Drop Columns",
+        available_cols,
+        key=drop_key,
+        help="Optional: remove IDs, leakage columns, or irrelevant fields.",
+    )
+
+    cfg["target_column"] = st.session_state[target_key]
+    cfg["feature_columns"] = [c for c in st.session_state[feature_key] if c != cfg["target_column"]]
+    cfg["drop_columns"] = [c for c in st.session_state[drop_key] if c != cfg["target_column"]]
+
+    c1, c2, c3, c4 = st.columns(4)
+    cfg["auto_datetime"] = c1.checkbox("Expand datetime columns", value=bool(cfg["auto_datetime"]))
+    cfg["drop_duplicates"] = c2.checkbox("Drop duplicates", value=bool(cfg["drop_duplicates"]))
+    cfg["shuffle_data"] = c3.checkbox("Shuffle before split", value=bool(cfg["shuffle_data"]))
+    cfg["use_class_weights"] = c4.checkbox("Class weights", value=bool(cfg["use_class_weights"]))
+
+    c5, c6 = st.columns(2)
+    cfg["test_size"] = c5.slider("Test Size", 0.10, 0.40, float(cfg["test_size"]), 0.05)
+    cfg["random_seed"] = c6.number_input("Random Seed", min_value=0, max_value=999999, value=int(cfg["random_seed"]), step=1)
+
+    st.session_state.config = cfg
+
+    if st.button("Prepare Dataset", use_container_width=True):
+        try:
+            prepared = prepare_dataset(df, cfg)
+            st.session_state.prepared_data = prepared
+            st.success("Dataset prepared successfully.")
+        except Exception as e:
+            st.error(f"Preparation failed: {e}")
+
+    prepared = st.session_state.prepared_data
+    if prepared:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Task", prepared["task"].title())
+        c2.metric("Train Rows", prepared["X_train"].shape[0])
+        c3.metric("Test Rows", prepared["X_test"].shape[0])
+        c4.metric("Engineered Features", prepared["X_train"].shape[1])
+
+        with st.expander("Prepared dataset details", expanded=True):
+            st.write({
+                "target_column": prepared["target_column"],
+                "original_features": prepared["feature_columns_original"],
+                "datetime_expanded_columns": prepared["datetime_expanded_columns"],
+                "numeric_features": prepared["num_cols"],
+                "categorical_features": prepared["cat_cols"],
+            })
+
+def page_train():
+    st.title("Train")
+    prepared = st.session_state.prepared_data
+    if prepared is None:
+        st.info("Prepare the dataset first.")
+        return
+
+    st.subheader("Training Summary")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Task", prepared["task"].title())
+    c2.metric("Target", prepared["target_column"])
+    c3.metric("Train Samples", prepared["X_train"].shape[0])
+    c4.metric("Test Samples", prepared["X_test"].shape[0])
+
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("Input Features", prepared["X_train"].shape[1])
+    c6.metric("Original Features", len(prepared["feature_columns_original"]))
+    c7.metric("Numeric Columns", len(prepared["num_cols"]))
+    c8.metric("Categorical Columns", len(prepared["cat_cols"]))
+
+    with st.expander("Training configuration", expanded=False):
+        config_rows = [
+            {"setting": "Optimizer", "value": st.session_state.config["optimizer"]},
+            {"setting": "Learning Rate", "value": st.session_state.config["learning_rate"]},
+            {"setting": "Epochs", "value": st.session_state.config["epochs"]},
+            {"setting": "Batch Size", "value": st.session_state.config["batch_size"]},
+            {"setting": "Validation Split", "value": st.session_state.config["validation_split"]},
+            {"setting": "Early Stopping", "value": st.session_state.config["early_stopping"]},
+            {"setting": "Patience", "value": st.session_state.config["patience"]},
+            {"setting": "Class Weights", "value": st.session_state.config["use_class_weights"]},
+        ]
+        st.dataframe(pd.DataFrame(config_rows), use_container_width=True, hide_index=True)
+
+    if st.button("Start Training", type="primary", use_container_width=True):
+        try:
+            model, history, results = train_model(prepared, st.session_state.config)
+            st.session_state.trained_model = model
+            st.session_state.training_history = history
+            st.session_state.results = results
+            st.success("Model trained successfully.")
+        except Exception as e:
+            st.error(f"Training failed: {e}")
+
+    if st.session_state.training_history:
+        st.subheader("Latest training history")
+        st.dataframe(pd.DataFrame(st.session_state.training_history), use_container_width=True)
+
+def page_evaluate():
+    st.title("Evaluate")
+    results = st.session_state.results
+    if not results:
+        st.info("Train or load a model first.")
+        return
+
+    task = results["task"]
+    metrics = results["metrics"]
+    cols = st.columns(len(metrics))
+    for i, (k, v) in enumerate(metrics.items()):
+        cols[i].metric(k.upper(), f"{v:.4f}")
+
+    if task == "classification":
+        class_names = results["class_names"]
+        y_true = np.asarray(results["y_true"])
+        y_pred = np.asarray(results["y_pred"])
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.pyplot(make_confusion_fig(y_true, y_pred, class_names), clear_figure=True, use_container_width=True)
+        with c2:
+            st.pyplot(make_predicted_distribution_fig(y_pred), clear_figure=True, use_container_width=True)
+
+        report_df = pd.DataFrame(results["classification_report"]).T
+        st.subheader("Classification Report")
+        st.dataframe(report_df, use_container_width=True)
+
+        if len(class_names) == 2:
+            fig1, fig2 = make_binary_curve_figs(y_true, results.get("y_score"))
+            c3, c4 = st.columns(2)
+            with c3:
+                st.pyplot(fig1, clear_figure=True, use_container_width=True)
+            with c4:
+                st.pyplot(fig2, clear_figure=True, use_container_width=True)
+    else:
+        y_true = np.asarray(results["y_true"])
+        y_pred = np.asarray(results["y_pred"])
+        error_df = pd.DataFrame({
+            "actual": y_true,
+            "predicted": y_pred,
+            "residual": y_true - y_pred,
+            "abs_error": np.abs(y_true - y_pred),
+        })
+        st.subheader("Prediction Errors")
+        st.dataframe(error_df.head(300), use_container_width=True)
+
+        fig1, fig2, fig3, fig4 = make_regression_figures(y_true, y_pred)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.pyplot(fig1, clear_figure=True, use_container_width=True)
+        with c2:
+            st.pyplot(fig2, clear_figure=True, use_container_width=True)
+        c3, c4 = st.columns(2)
+        with c3:
+            st.pyplot(fig3, clear_figure=True, use_container_width=True)
+        with c4:
+            st.pyplot(fig4, clear_figure=True, use_container_width=True)
+
+def page_predict():
+    st.title("Predict")
+    model = st.session_state.trained_model
+    prepared = st.session_state.prepared_data
+    if model is None or prepared is None:
+        st.info("Train or load a project first.")
+        return
+
+    st.subheader("Manual Single Prediction")
+    schema = prepared["feature_schema"]
+    manual_values = {}
+    cols = st.columns(2)
+    feature_cols = prepared["feature_columns_original"]
+
+    for idx, col in enumerate(feature_cols):
+        with cols[idx % 2]:
+            meta = schema[col]
+            if meta["is_numeric"]:
+                manual_values[col] = st.text_input(f"{col}", value=str(meta["example"] or "0"))
+            else:
+                options = meta["categories"] or []
+                options = [""] + options
+                manual_values[col] = st.selectbox(f"{col}", options=options, index=0)
+
+    if st.button("Run Single Prediction", use_container_width=True):
+        row = {}
+        for col in feature_cols:
+            meta = schema[col]
+            val = manual_values[col]
+            if meta["is_numeric"]:
+                try:
+                    row[col] = float(val)
+                except Exception:
+                    row[col] = np.nan
+            else:
+                row[col] = val if val != "" else np.nan
+        pred_df = pd.DataFrame([row])
+        out = predict_with_pipeline(model, prepared, pred_df, threshold=float(st.session_state.config["threshold"]))
+        st.dataframe(out, use_container_width=True)
+
+    st.divider()
+    st.subheader("Batch Prediction")
+    uploaded = st.file_uploader("Upload prediction file", type=["csv", "xlsx", "xls"], key="pred_file")
+    if uploaded is not None:
+        try:
+            pred_df = read_uploaded_table(uploaded)
+            out = predict_with_pipeline(model, prepared, pred_df, threshold=float(st.session_state.config["threshold"]))
+            st.dataframe(out.head(100), use_container_width=True)
+            st.download_button(
+                "Download Predictions CSV",
+                data=out.to_csv(index=False).encode("utf-8"),
+                file_name="predictions.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.error(f"Prediction failed: {e}")
+
+def page_visualize():
+    st.title("Visualize")
+    df = st.session_state.raw_df
+    if df is not None:
+        plot_data_profile(df, st.session_state.config.get("target_column"))
+
+    st.subheader("Training Curves")
+    history = st.session_state.training_history
+    if history:
+        base_metrics = ["loss"] + sorted({
+            (k[4:] if k.startswith("val_") else k)
+            for k in history.keys()
+            if k != "val_loss" and not k.startswith("val_val_")
+        } - {"loss"})
+        for i in range(0, len(base_metrics), 2):
+            row = st.columns(2)
+            for j, metric in enumerate(base_metrics[i:i+2]):
+                with row[j]:
+                    st.pyplot(make_training_curve_fig(history, metric), clear_figure=True, use_container_width=True)
+    else:
+        st.info("No training history available yet.")
+
+    results = st.session_state.results
+    if not results:
+        return
+
+    st.subheader("Model Performance Visuals")
+    if results["task"] == "classification":
+        c1, c2 = st.columns(2)
+        with c1:
+            st.pyplot(make_confusion_fig(results["y_true"], results["y_pred"], results["class_names"]), clear_figure=True, use_container_width=True)
+        with c2:
+            st.pyplot(make_predicted_distribution_fig(results["y_pred"]), clear_figure=True, use_container_width=True)
+
+        if len(results["class_names"]) == 2:
+            fig1, fig2 = make_binary_curve_figs(results["y_true"], results.get("y_score"))
+            c3, c4 = st.columns(2)
+            with c3:
+                st.pyplot(fig1, clear_figure=True, use_container_width=True)
+            with c4:
+                st.pyplot(fig2, clear_figure=True, use_container_width=True)
+    else:
+        fig1, fig2, fig3, fig4 = make_regression_figures(np.asarray(results["y_true"]), np.asarray(results["y_pred"]))
+        c1, c2 = st.columns(2)
+        with c1:
+            st.pyplot(fig1, clear_figure=True, use_container_width=True)
+        with c2:
+            st.pyplot(fig2, clear_figure=True, use_container_width=True)
+        c3, c4 = st.columns(2)
+        with c3:
+            st.pyplot(fig3, clear_figure=True, use_container_width=True)
+        with c4:
+            st.pyplot(fig4, clear_figure=True, use_container_width=True)
+
+def page_save_load():
+    st.title("Save / Load")
+    st.caption("Export the whole ANN project or reload a previous bundle.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.session_state.trained_model is not None and st.session_state.prepared_data is not None:
+            try:
+                bundle_bytes = create_project_bundle_bytes()
+                st.download_button(
+                    "Download Project Bundle (.zip)",
+                    data=bundle_bytes,
+                    file_name=f"{safe_filename(st.session_state.config['project_name'])}.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.error(f"Failed to package project: {e}")
+        else:
+            st.info("Train or load a project to enable export.")
+
+        if st.button("Save Project Locally", use_container_width=True):
+            try:
+                path = save_project_locally()
+                st.success(f"Saved to {path}")
+            except Exception as e:
+                st.error(f"Local save failed: {e}")
+
+    with c2:
+        uploaded = st.file_uploader("Load bundle (.zip)", type=["zip"], key="load_bundle")
+        if uploaded is not None:
+            try:
+                load_project_from_zip_bytes(uploaded.read())
+                st.success("Project loaded successfully.")
+            except Exception as e:
+                st.error(f"Load failed: {e}")
+
+    st.subheader("Local Saved Bundles")
+    local_files = sorted(PROJECTS_DIR.glob("*.zip"), reverse=True)
+    if local_files:
+        df = pd.DataFrame({
+            "file": [p.name for p in local_files],
+            "size_kb": [round(p.stat().st_size / 1024, 2) for p in local_files],
+            "modified": [datetime.fromtimestamp(p.stat().st_mtime).isoformat(sep=" ", timespec="seconds") for p in local_files],
+        })
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.info("No local bundles found yet.")
+
+# ----------------------------- #
+# Workflow / project helpers
+# ----------------------------- #
+ANN_PAGES = [
+    "Home",
+    "Data Upload",
+    "Model",
+    "Preprocess",
+    "Train",
+    "Evaluate",
+    "Predict",
+    "Visualize",
+    "Save/Load",
+]
+
+
+def _ann_go(page_name: str):
+    st.session_state["page"] = page_name
+
+
+def _ann_reset_state(target_page: str):
+    preserved = {k: st.session_state[k] for k in list(st.session_state.keys()) if str(k).startswith("__unified_")}
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+    for k, v in preserved.items():
+        st.session_state[k] = v
+    init_state()
+    st.session_state["page"] = target_page
+    st.rerun()
+
+
+def _ann_bottom_nav(page_name: str):
+    idx = ANN_PAGES.index(page_name) if page_name in ANN_PAGES else 0
+    st.write("")
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        if idx == 0:
+            st.button("⬅ Back to Home", use_container_width=True, disabled=True, key=f"ann_back_{page_name}")
+        else:
+            prev_page = ANN_PAGES[idx - 1]
+            st.button(f"⬅ Back to {prev_page}", use_container_width=True, key=f"ann_back_{page_name}", on_click=_ann_go, args=(prev_page,))
+    with c2:
+        if idx >= len(ANN_PAGES) - 1:
+            st.button("Continue ➜", use_container_width=True, disabled=True, key=f"ann_next_{page_name}")
+        else:
+            next_page = ANN_PAGES[idx + 1]
+            st.button(f"Continue to {next_page} ➜", use_container_width=True, key=f"ann_next_{page_name}", on_click=_ann_go, args=(next_page,))
+
+
+# ----------------------------- #
+# Main
+# ----------------------------- #
+def main():
+    inject_css()
+    init_state()
+
+    if "page" not in st.session_state or st.session_state["page"] not in ANN_PAGES:
+        st.session_state["page"] = "Home"
+
+    st.sidebar.title("Navigation")
+    selected = st.sidebar.radio(
+        "Go to",
+        ANN_PAGES,
+        index=ANN_PAGES.index(st.session_state["page"]),
+    )
+    st.session_state["page"] = selected
+
+    st.sidebar.markdown("### Status")
+    st.sidebar.markdown(f'<span class="status-pill">Dataset: {"Ready" if st.session_state.raw_df is not None else "Missing"}</span>', unsafe_allow_html=True)
+    st.sidebar.markdown(f'<span class="status-pill">Prepared: {"Yes" if st.session_state.prepared_data is not None else "No"}</span>', unsafe_allow_html=True)
+    st.sidebar.markdown(f'<span class="status-pill">Model: {"Trained/Loaded" if st.session_state.trained_model is not None else "None"}</span>', unsafe_allow_html=True)
+
+    st.sidebar.write("---")
+    if st.sidebar.button("➕ New Project", use_container_width=True):
+        _ann_reset_state("Data Upload")
+    if st.sidebar.button("🗑️ Clear Current Project", use_container_width=True):
+        _ann_reset_state("Home")
+
+    page = st.session_state["page"]
+    if page == "Home":
+        page_home()
+    elif page == "Data Upload":
+        page_data_upload()
+    elif page == "Model":
+        page_model()
+    elif page == "Preprocess":
+        page_preprocess()
+    elif page == "Train":
+        page_train()
+    elif page == "Evaluate":
+        page_evaluate()
+    elif page == "Predict":
+        page_predict()
+    elif page == "Visualize":
+        page_visualize()
+    elif page == "Save/Load":
+        page_save_load()
+
+    _ann_bottom_nav(page)
+
+if __name__ == "__main__":
+    main()
+'''
+
+CNN_SOURCE = r'''
+import os
+import io
+import json
+import math
+import time
+import shutil
+import random
+import zipfile
+from pathlib import Path
+from datetime import datetime
+
+import joblib
+import numpy as np
+import pandas as pd
+from PIL import Image, ImageOps, UnidentifiedImageError
+
+import streamlit as st
+import matplotlib.pyplot as plt
+
+plt.rcParams["figure.dpi"] = 110
+plt.rcParams["savefig.dpi"] = 110
+plt.rcParams["axes.titlesize"] = 11
+plt.rcParams["axes.labelsize"] = 9
+plt.rcParams["xtick.labelsize"] = 8
+plt.rcParams["ytick.labelsize"] = 8
+plt.rcParams["legend.fontsize"] = 8
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    confusion_matrix,
+    classification_report,
+    accuracy_score,
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_curve,
+    auc,
+    precision_recall_curve,
+    average_precision_score,
+    roc_auc_score,
+    log_loss,
+)
+from sklearn.preprocessing import label_binarize
+from sklearn.decomposition import PCA
+from sklearn.utils.class_weight import compute_class_weight
+
+
+# -----------------------------
+# Paths / constants
+# -----------------------------
+APP_TITLE = "Oil & Gas CNN Studio"
+APP_DIR = Path(".oil_gas_cnn_studio")
+DATA_DIR = APP_DIR / "datasets"
+MODEL_DIR = APP_DIR / "saved_projects"
+CACHE_DIR = APP_DIR / "cache"
+
+for p in [APP_DIR, DATA_DIR, MODEL_DIR, CACHE_DIR]:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+# -----------------------------
+# Lazy TensorFlow import
+# -----------------------------
+_TF = None
+
+
+def get_tf():
+    global _TF
+    if _TF is None:
+        import tensorflow as tf
+        _TF = tf
+    return _TF
+
+
+# -----------------------------
+# Streamlit config / CSS
+# -----------------------------
+st.set_page_config(page_title=APP_TITLE, layout="wide", initial_sidebar_state="expanded")
+
+st.markdown(
+    """
+    <style>
+        .main .block-container {padding-top: 1.0rem; padding-bottom: 1.2rem;}
+        div[data-testid="stHorizontalBlock"] {gap: 0.55rem;}
+        .hero {
+            background: linear-gradient(135deg, #0f172a 0%, #1d4ed8 55%, #0ea5e9 100%);
+            padding: 1.3rem 1.5rem;
+            border-radius: 20px;
+            color: white;
+            margin-bottom: 1rem;
+            box-shadow: 0 10px 30px rgba(2,6,23,0.16);
+        }
+        .card {
+            background: #ffffff;
+            border: 1px solid rgba(15,23,42,0.08);
+            border-radius: 18px;
+            padding: 1rem 1.1rem;
+            box-shadow: 0 8px 24px rgba(15,23,42,0.05);
+            margin-bottom: 0.9rem;
+        }
+        .small-note {
+            color: #475569;
+            font-size: 0.92rem;
+        }
+        .status-chip {
+            display:inline-block;
+            padding:0.28rem 0.6rem;
+            border-radius:999px;
+            background:#eff6ff;
+            border:1px solid #bfdbfe;
+            color:#1d4ed8;
+            font-size:0.85rem;
+            margin-right:0.35rem;
+            margin-bottom:0.35rem;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# -----------------------------
+# Utility helpers
+# -----------------------------
+def seed_everything(seed: int = 42):
+    random.seed(seed)
     np.random.seed(seed)
+    tf = get_tf()
     tf.random.set_seed(seed)
 
 
-def _coerce_numeric_series(s: pd.Series) -> pd.Series:
-    if pd.api.types.is_numeric_dtype(s):
-        return s.astype(float)
-    if s.dtype == "object":
-        s = s.astype(str).str.replace(r"[^\d.-]", "", regex=True)
-    return pd.to_numeric(s, errors="coerce").astype(float)
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _infer_lstm_task_from_target(y_raw: pd.Series) -> str:
-    t = infer_task(y_raw)
-    return "classification" if t == "classification" else "regression"
-
-
-def _encode_lstm_target(y_raw: pd.Series, task: str):
-    """
-    Regression: numeric float
-    Classification: integer class ids + label encoder
-    """
-    if task == "regression":
-        y = _coerce_numeric_series(y_raw)
-        return y.astype(float), None
-
-    sk = _get_sklearn()
-    LabelEncoder = sk["LabelEncoder"]
-    le = LabelEncoder()
-    y_str = y_raw.astype(str).fillna("NA")
-    y_int = le.fit_transform(y_str).astype(int)
-    return pd.Series(y_int, index=y_raw.index), le
-
-
-def _prepare_multivariate_frame_safe(
-    df: pd.DataFrame,
-    target_col: str,
-    feature_cols: List[str],
-    date_col: Optional[str],
-    task: str,
-) -> Tuple[pd.DataFrame, List[str], List[str], str, Optional[Any]]:
-    warns: List[str] = []
-
-    df = _clean_df_minimal(df)
-    if target_col not in df.columns:
-        raise ValueError(f"Target column '{target_col}' not found.")
-    for c in feature_cols:
-        if c not in df.columns:
-            raise ValueError(f"Feature column '{c}' not found.")
-
-    work = df.copy()
-
-    if date_col and date_col in work.columns:
-        work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
-        before = len(work)
-        work = work.dropna(subset=[date_col])
-        if len(work) < before:
-            warns.append("Dropped rows with invalid time values in the time column.")
-        work = work.sort_values(date_col)
-
-    X = work[feature_cols].copy()
-    X = _expand_datetime_features(X)
-    X = pd.get_dummies(X, dummy_na=True)
-
-    y_raw = work[target_col]
-    task_used = _infer_lstm_task_from_target(y_raw) if task == "auto" else task
-    y_encoded, le = _encode_lstm_target(y_raw, task_used)
-
-    aligned = X.copy()
-    aligned["_target_"] = y_encoded.values
-
-    aligned = aligned.replace([np.inf, -np.inf], np.nan)
-    aligned = aligned.ffill().bfill()
-    aligned = aligned.dropna(axis=0, how="any")
-
-    if len(aligned) < 10:
-        raise ValueError(f"After cleaning, only {len(aligned)} usable rows remain. Need more data for LSTM.")
-
-    input_cols = [c for c in aligned.columns if c != "_target_"] + ["_target_"]
-    return aligned, input_cols, warns, task_used, le
-
-
-def make_sequences_multivariate(arr: np.ndarray, lookback: int, horizon: int, task: str) -> Tuple[np.ndarray, np.ndarray]:
-    if lookback < 1:
-        raise ValueError("lookback must be >= 1")
-    if horizon < 1:
-        raise ValueError("horizon must be >= 1")
-    if len(arr) <= lookback + horizon - 1:
-        raise ValueError("Not enough data for lookback+horizon.")
-
-    X, y = [], []
-    target_idx = arr.shape[1] - 1
-    for i in range(lookback, len(arr) - horizon + 1):
-        X.append(arr[i - lookback: i, :])
-        y_val = arr[i + horizon - 1, target_idx]
-        y.append(y_val)
-
-    X = np.array(X, dtype=np.float32)
-    if task == "classification":
-        y = np.array(y, dtype=np.int32)
-    else:
-        y = np.array(y, dtype=np.float32)
-    return X, y
-
-
-def build_lstm_multivariate(lookback: int, n_channels: int, lstm_units: int, dropout: float, task: str, n_classes: int = 2):
-    _, layers, Sequential, _ = _get_tf_keras()
-    tf = _get_tf()
-
-    model = Sequential()
-    model.add(layers.Input(shape=(lookback, n_channels)))
-    model.add(layers.LSTM(int(lstm_units), return_sequences=True))
-    model.add(layers.Dropout(float(dropout)))
-    model.add(layers.LSTM(int(lstm_units)))
-    model.add(layers.Dropout(float(dropout)))
-
-    if task == "classification":
-        if n_classes == 2:
-            model.add(layers.Dense(1, activation="sigmoid"))
-            loss = "binary_crossentropy"
-        else:
-            model.add(layers.Dense(int(n_classes), activation="softmax"))
-            loss = "sparse_categorical_crossentropy"
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=0.001, clipnorm=1.0),
-            loss=loss,
-            metrics=["accuracy"],
-        )
-    else:
-        model.add(layers.Dense(1))
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=0.001, clipnorm=1.0),
-            loss="mse",
-        )
-
-    return model
-
-
-def train_lstm_from_df(
-    df: pd.DataFrame,
-    cfg: LSTMConfig,
-) -> Tuple[Optional[Any], Optional[Dict[str, Any]], Dict[str, list], Dict[str, Any], Dict[str, np.ndarray]]:
-    sk = _get_sklearn()
-    MinMaxScaler = sk["MinMaxScaler"]
-    mean_squared_error = sk["mean_squared_error"]
-    mean_absolute_error = sk["mean_absolute_error"]
-    r2_score = sk["r2_score"]
-    accuracy_score = sk["accuracy_score"]
-    precision_score = sk["precision_score"]
-    recall_score = sk["recall_score"]
-    f1_score = sk["f1_score"]
-    confusion_matrix = sk["confusion_matrix"]
-
-    _, _, _, EarlyStopping = _get_tf_keras()
-
-    metrics: Dict[str, Any] = {"status": "ok", "message": "", "warnings": []}
-    history: Dict[str, list] = {"loss": [], "val_loss": []}
-    outputs: Dict[str, np.ndarray] = {}
-
+def safe_int(v, default):
     try:
-        _set_seed(int(cfg.seed))
-
-        aligned, input_cols, warns, task_used, label_encoder = _prepare_multivariate_frame_safe(
-            df, cfg.target_col, cfg.feature_cols, cfg.date_col, cfg.task
-        )
-        metrics["warnings"].extend(warns)
-
-        Xy = aligned[[c for c in input_cols if c != "_target_"]].to_numpy(dtype=np.float32)
-        y_raw = aligned["_target_"].to_numpy().reshape(-1, 1)
-
-        # Build full array: features + target (target as float32 even for classification; we cast later)
-        full = np.concatenate([Xy, y_raw.astype(np.float32)], axis=1)
-
-        n = len(full)
-        test_size_adj, warns2 = _smart_split_sizes(n, cfg.test_size)
-        metrics["warnings"].extend(warns2)
-
-        split_idx = int(n * (1 - test_size_adj))
-        split_idx = max(2, min(split_idx, n - 1))
-
-        lookback = int(cfg.lookback)
-        horizon = int(cfg.horizon)
-
-        # --- Scaling differs per task ---
-        if task_used == "regression":
-            scaler_all = MinMaxScaler(feature_range=(0, 1))
-            scaler_y = MinMaxScaler(feature_range=(0, 1))
-
-            train_full = full[:split_idx]
-            test_full = full[split_idx:]
-
-            train_scaled = scaler_all.fit_transform(train_full)
-            test_scaled = scaler_all.transform(test_full)
-
-            scaler_y.fit(train_full[:, [-1]])
-            scaled_full = np.vstack([train_scaled, test_scaled]).astype(np.float32)
-
-            if len(scaled_full) <= lookback + horizon:
-                lookback = max(1, len(scaled_full) - horizon - 1)
-                metrics["warnings"].append("Auto-reduced lookback due to limited data length.")
-            else:
-
-
-                scaler_x = MinMaxScaler(feature_range=(0, 1))
-
-                X_only = full[:, :-1].astype(np.float32)
-                y_raw = aligned["_target_"].astype(str).values  # safer
-
-                # 🔥 Proper label encoding
-                label_encoder = LabelEncoder()
-                y_encoded = label_encoder.fit_transform(y_raw)
-
-                n_classes_total = int(np.max(y_encoded)) + 1
-
-                X_train_full = X_only[:split_idx]
-                X_test_full = X_only[split_idx:]
-
-                X_train_scaled = scaler_x.fit_transform(X_train_full)
-                X_test_scaled = scaler_x.transform(X_test_full)
-
-                X_scaled_full = np.vstack([X_train_scaled, X_test_scaled]).astype(np.float32)
-
-                scaled_full = np.concatenate(
-                    [X_scaled_full, y_encoded.reshape(-1, 1).astype(np.float32)],
-                    axis=1,
-                )
-
-                if len(scaled_full) <= lookback + horizon:
-                    lookback = max(1, len(scaled_full) - horizon - 1)
-                    metrics["warnings"].append("Auto-reduced lookback due to limited data length.")
-
-            if len(scaled_full) <= lookback + horizon:
-                lookback = max(1, len(scaled_full) - horizon - 1)
-                metrics["warnings"].append("Auto-reduced lookback due to limited data length.")
-
-        X_seq, y_seq = make_sequences_multivariate(scaled_full, lookback=lookback, horizon=horizon, task=task_used)
-
-        if len(X_seq) < 2:
-            return None, None, history, {
-                "status": "error",
-                "message": "Not enough sequences after preprocessing for LSTM training.",
-                "warnings": metrics.get("warnings", []),
-            }, outputs
-
-        n_seq = len(X_seq)
-        test_size_adj2, warns3 = _smart_split_sizes(n_seq, test_size_adj)
-        metrics["warnings"].extend(warns3)
-
-        seq_split = int(n_seq * (1 - test_size_adj2))
-        seq_split = max(1, min(seq_split, n_seq - 1))
-
-        X_train, y_train = X_seq[:seq_split], y_seq[:seq_split]
-        X_test, y_test = X_seq[seq_split:], y_seq[seq_split:]
-
-        if task_used == "classification":
-            n_classes = int(np.max(y_seq)) + 1
-            if n_classes < 2:
-                return None, None, history, {
-                    "status": "error",
-                    "message": "LSTM classification requires at least 2 classes after cleaning.",
-                    "warnings": metrics.get("warnings", []),
-                }, outputs
-        else:
-            n_classes = 1
-
-        model = build_lstm_multivariate(
-            lookback=lookback,
-            n_channels=int(X_train.shape[2]),
-            lstm_units=int(cfg.lstm_units),
-            dropout=float(cfg.dropout),
-            task=task_used,
-            n_classes=n_classes,
-        )
-
-        cb = EarlyStopping(monitor="val_loss", patience=int(cfg.patience), restore_best_weights=True)
-        hist = model.fit(
-            X_train,
-            y_train,
-            epochs=int(cfg.epochs),
-            batch_size=int(cfg.batch_size),
-            validation_split=float(cfg.val_split),
-            callbacks=[cb],
-            verbose=0,
-        )
-        history = {k: [float(x) for x in v] for k, v in hist.history.items()}
-
-        # --- Metrics & outputs ---
-        if task_used == "regression":
-            # predictions are scaled, invert via scaler_y
-            train_pred = model.predict(X_train, verbose=0).reshape(-1, 1)
-            test_pred = model.predict(X_test, verbose=0).reshape(-1, 1)
-
-            # invert
-            y_train_actual = scaler_y.inverse_transform(y_train.reshape(-1, 1))
-            y_test_actual = scaler_y.inverse_transform(y_test.reshape(-1, 1))
-            train_pred_actual = scaler_y.inverse_transform(train_pred)
-            test_pred_actual = scaler_y.inverse_transform(test_pred)
-
-            y_test_flat = y_test_actual.reshape(-1)
-            pred_flat = test_pred_actual.reshape(-1)
-            mask = np.isfinite(y_test_flat) & np.isfinite(pred_flat)
-
-            rmse = float(np.sqrt(mean_squared_error(y_test_flat[mask], pred_flat[mask]))) if mask.sum() else 0.0
-            mae = float(mean_absolute_error(y_test_flat[mask], pred_flat[mask])) if mask.sum() else 0.0
-            try:
-                r2 = float(r2_score(y_test_flat[mask], pred_flat[mask])) if mask.sum() >= 2 else 0.0
-            except Exception:
-                r2 = 0.0
-
-            metrics.update(
-                {
-                    "status": "ok",
-                    "task": "regression",
-                    "rmse": rmse,
-                    "mae": mae,
-                    "r2_score": r2,
-                    "lookback_used": int(lookback),
-                    "horizon_used": int(horizon),
-                    "channels_used": int(X_train.shape[2]),
-                    "rows_used": int(len(aligned)),
-                    "train_sequences": int(len(X_train)),
-                    "test_sequences": int(len(X_test)),
-                }
-            )
-
-            pack = {
-                "task": "regression",
-                "scaler_all": scaler_all,
-                "scaler_y": scaler_y,
-                "label_encoder": None,
-                "input_feature_columns": [c for c in input_cols if c != "_target_"],
-                "target_column": cfg.target_col,
-            }
-
-            # For forecasting we need last feature values (scaled) to hold constant
-            last_feature_scaled = scaled_full[-1, :-1].astype(np.float32)
-
-            outputs = {
-                "scaled_full": scaled_full.astype(np.float32),
-                "lookback": np.array([lookback], dtype=np.int32),
-                "horizon": np.array([horizon], dtype=np.int32),
-                "last_feature_scaled": last_feature_scaled.astype(np.float32),
-                "y_train_actual": y_train_actual.astype(np.float32),
-                "y_test_actual": y_test_actual.astype(np.float32),
-                "train_pred_actual": train_pred_actual.astype(np.float32),
-                "test_pred_actual": test_pred_actual.astype(np.float32),
-            }
-
-            return model, pack, history, metrics, outputs
-
-        else:
-            probs = model.predict(X_test, verbose=0)
-            y_true = y_test.astype(int)
-
-            if n_classes == 2:
-                y_score = probs.reshape(-1).astype(float)
-                y_pred = (y_score >= 0.5).astype(int)
-            else:
-                y_pred = np.argmax(probs, axis=1).astype(int)
-                y_score = None
-
-            cm = confusion_matrix(y_true, y_pred).tolist()
-
-            metrics.update(
-                {
-                    "status": "ok",
-                    "task": "classification",
-                    "classes": int(n_classes),
-                    "accuracy": float(accuracy_score(y_true, y_pred)),
-                    "precision": float(precision_score(y_true, y_pred, average="weighted", zero_division=0)),
-                    "recall": float(recall_score(y_true, y_pred, average="weighted", zero_division=0)),
-                    "f1_score": float(f1_score(y_true, y_pred, average="weighted", zero_division=0)),
-                    "confusion_matrix": cm,
-                    "class_labels": (label_encoder.classes_.tolist() if label_encoder is not None else None),
-                    "lookback_used": int(lookback),
-                    "horizon_used": int(horizon),
-                    "channels_used": int(X_train.shape[2]),
-                    "rows_used": int(len(aligned)),
-                    "train_sequences": int(len(X_train)),
-                    "test_sequences": int(len(X_test)),
-                }
-            )
-
-            pack = {
-                "task": "classification",
-                "scaler_x": scaler_x,
-                "scaler_all": None,
-                "scaler_y": None,
-                "label_encoder": label_encoder,
-                "input_feature_columns": [c for c in input_cols if c != "_target_"],
-                "target_column": cfg.target_col,
-            }
-
-            outputs = {
-                "scaled_full": scaled_full.astype(np.float32),
-                "lookback": np.array([lookback], dtype=np.int32),
-                "horizon": np.array([horizon], dtype=np.int32),
-                "y_test_cls": y_true.astype(np.int32),
-                "y_pred_cls": y_pred.astype(np.int32),
-            }
-            if n_classes == 2 and y_score is not None:
-                outputs["y_score_cls"] = y_score.astype(np.float32)
-
-            return model, pack, history, metrics, outputs
-
-    except Exception as e:
-        return None, None, history, {
-            "status": "error",
-            "message": f"LSTM training failed: {e}",
-            "warnings": metrics.get("warnings", []),
-        }, outputs
-
-
-def forecast_future_multivariate(
-    model,
-    scaler_y,
-    scaled_full: np.ndarray,
-    lookback: int,
-    n_steps: int,
-    last_feature_scaled: np.ndarray,
-) -> np.ndarray:
-    if n_steps < 1:
-        raise ValueError("n_steps must be >= 1")
-    if len(scaled_full) <= lookback:
-        raise ValueError("Not enough history to forecast. Increase data or reduce lookback.")
-
-    n_channels = scaled_full.shape[1]
-    curr = scaled_full[-lookback:, :].reshape(1, lookback, n_channels).astype(np.float32)
-
-    preds_scaled = []
-    for _ in range(n_steps):
-        p = model.predict(curr, verbose=0).reshape(-1)[0]
-        preds_scaled.append(p)
-
-        next_row = np.concatenate([last_feature_scaled, np.array([p], dtype=np.float32)], axis=0).reshape(1, 1, n_channels)
-        curr = np.concatenate([curr[:, 1:, :], next_row], axis=1)
-
-    preds_scaled = np.array(preds_scaled, dtype=np.float32).reshape(-1, 1)
-    preds_inv = scaler_y.inverse_transform(preds_scaled)
-    return preds_inv
-
-
-def lstm_predict_next_class(
-    model,
-    outputs: Dict[str, np.ndarray],
-    pack: Dict[str, Any],
-) -> Tuple[str, float]:
-    """
-    Predict the next class (at horizon) using the last lookback window.
-    Returns (label, confidence).
-    """
-    scaled_full = outputs["scaled_full"]
-    lookback = int(outputs["lookback"][0]) if "lookback" in outputs else 10
-    horizon = int(outputs["horizon"][0]) if "horizon" in outputs else 1
-
-    # We want the last lookback window to predict the class at horizon.
-    # Our model was trained to predict y at (t + horizon - 1) based on window ending at t-1.
-    # Using last window is acceptable for "next-step style" inference.
-    if len(scaled_full) <= lookback + horizon:
-        raise ValueError("Not enough history for classification inference.")
-
-    n_channels = scaled_full.shape[1]
-    X_last = scaled_full[-lookback:, :].reshape(1, lookback, n_channels).astype(np.float32)
-
-    probs = model.predict(X_last, verbose=0)
-    le = pack.get("label_encoder", None)
-
-    if probs.ndim == 2 and probs.shape[1] > 1:
-        idx = int(np.argmax(probs, axis=1)[0])
-        conf = float(np.max(probs, axis=1)[0])
-        label = str(idx)
-        if le is not None:
-            label = str(le.inverse_transform(np.array([idx], dtype=int))[0])
-        return label, conf
-
-    p = float(probs.reshape(-1)[0])
-    idx = int(p >= 0.5)
-    label = str(idx)
-    if le is not None:
-        label = str(le.inverse_transform(np.array([idx], dtype=int))[0])
-    conf = p if idx == 1 else (1.0 - p)
-    return label, float(conf)
-
-
-# ============================================================
-# Storage (projects persistence)
-# ============================================================
-DATA_DIR = Path(".neural_studio")
-DATA_DIR.mkdir(exist_ok=True)
-PROJECTS_FILE = DATA_DIR / "projects.json"
-CURRENT_FILE = DATA_DIR / "current_project.json"
-
-
-def _read_json(path: Path, default):
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return int(v)
     except Exception:
         return default
 
 
-def _write_json(path: Path, obj):
-    safe = _json_safe(obj)
-    path.write_text(json.dumps(safe, indent=2, ensure_ascii=False), encoding="utf-8")
+def safe_float(v, default):
+    try:
+        return float(v)
+    except Exception:
+        return default
 
 
-def get_projects() -> List[Dict[str, Any]]:
-    return _read_json(PROJECTS_FILE, [])
+def fig_show(fig):
+    st.pyplot(fig, use_container_width=False)
+    plt.close(fig)
 
 
-def save_projects(projects: List[Dict[str, Any]]) -> None:
-    _write_json(PROJECTS_FILE, projects)
+def bytes_from_pil(img: Image.Image, fmt="PNG"):
+    buf = io.BytesIO()
+    img.save(buf, format=fmt)
+    return buf.getvalue()
 
 
-def get_current_project() -> Optional[Dict[str, Any]]:
-    return _read_json(CURRENT_FILE, None)
+def init_state():
+    defaults = {
+        "page": "Home",
+        "project_name": "oil_gas_cnn_project",
+        "dataset_root": None,
+        "dataset_df": None,
+        "class_names": [],
+        "data_summary": {},
+        "model_config": {
+            "seed": 42,
+            "val_ratio": 0.2,
+            "batch_size": 16,
+            "image_size": 224,
+            "color_mode": "RGB",
+            "backbone": "MobileNetV2",
+            "weights": "imagenet",
+            "dense_units": 128,
+            "dropout": 0.30,
+            "label_smoothing": 0.0,
+            "learning_rate": 1e-3,
+            "epochs_stage1": 8,
+            "epochs_stage2": 4,
+            "fine_tune": True,
+            "unfreeze_layers": 30,
+            "fine_tune_lr": 1e-5,
+            "optimizer": "Adam",
+            "augmentation": {
+                "flip": True,
+                "rotation": 0.08,
+                "zoom": 0.10,
+                "contrast": 0.10,
+                "brightness": 0.10,
+            },
+            "use_class_weights": True,
+            "shuffle_buffer": 1024,
+        },
+        "trained_model": None,
+        "history": None,
+        "eval_artifacts": None,
+        "feature_model_layer": None,
+        "loaded_project_path": None,
+        "training_complete": False,
+        "last_uploaded_images": [],
+        "invalid_dataset_files": [],
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
 
-def set_current_project(project: Dict[str, Any]) -> None:
-    _write_json(CURRENT_FILE, project)
+def status_bar():
+    df = st.session_state.dataset_df
+    classes = len(st.session_state.class_names) if st.session_state.class_names else 0
+    trained = st.session_state.training_complete and st.session_state.trained_model is not None
+    chips = [
+        f"<span class='status-chip'>Project: {st.session_state.project_name}</span>",
+        f"<span class='status-chip'>Samples: {0 if df is None else len(df)}</span>",
+        f"<span class='status-chip'>Classes: {classes}</span>",
+        f"<span class='status-chip'>Model Ready: {'Yes' if trained else 'No'}</span>",
+    ]
+    st.markdown("".join(chips), unsafe_allow_html=True)
 
 
-def upsert_project(project: Dict[str, Any]) -> None:
-    projects = get_projects()
-    idx = next((i for i, p in enumerate(projects) if p.get("id") == project.get("id")), None)
-    if idx is None:
-        projects.insert(0, project)
+def hero():
+    st.markdown(
+        f"""
+        <div class="hero">
+            <h2 style="margin:0 0 0.35rem 0;">{APP_TITLE}</h2>
+            <div style="font-size:1rem; line-height:1.55;">
+                Professional CNN workflow for oil & gas image classification:
+                seismic slices, core photos, rock thin sections, corrosion images,
+                facility inspections, and other 2D visual datasets.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def ensure_rgb(img: Image.Image, mode: str = "RGB") -> Image.Image:
+    if mode == "RGB":
+        return img.convert("RGB")
+    gray = ImageOps.grayscale(img)
+    arr = np.array(gray)
+    arr3 = np.stack([arr, arr, arr], axis=-1)
+    return Image.fromarray(arr3)
+
+
+def save_uploaded_zip(uploaded_file, project_name: str) -> Path:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target_dir = DATA_DIR / f"{project_name}_{ts}"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = target_dir / uploaded_file.name
+    with open(zip_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    extract_dir = target_dir / "extracted"
+    extract_dir.mkdir(exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(extract_dir)
+    return extract_dir
+
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".jfif", ".gif", ".heic", ".heif"}
+
+
+def open_uploaded_image(uploaded_file):
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        pass
+    try:
+        img = Image.open(uploaded_file)
+        img.load()
+        return img, None
+    except UnidentifiedImageError:
+        name = getattr(uploaded_file, "name", "file")
+        suffix = Path(name).suffix.lower()
+        if suffix in {".heic", ".heif"}:
+            return None, (
+                f"{name}: HEIC/HEIF was selected, but Pillow usually cannot decode it by default. "
+                "Convert it to JPG/PNG first, or install pillow-heif in your environment."
+            )
+        return None, f"{name}: This file is not a readable image for Pillow. Use JPG, PNG, BMP, TIFF, WEBP, or GIF."
+    except Exception as e:
+        return None, f"{getattr(uploaded_file, 'name', 'file')}: {e}"
+
+
+def validate_image_file(filepath):
+    try:
+        with Image.open(filepath) as img:
+            img = ImageOps.exif_transpose(img)
+            img.load()
+            img.convert("RGB")
+        return True, None
+    except UnidentifiedImageError:
+        suffix = Path(filepath).suffix.lower()
+        if suffix in {".heic", ".heif"}:
+            return False, "HEIC/HEIF is not supported by default in this environment. Convert to JPG or PNG first."
+        return False, "Unreadable image file."
+    except Exception as e:
+        return False, str(e)
+
+
+def filter_valid_images(df: pd.DataFrame):
+    if df is None or df.empty:
+        return df, []
+    keep_rows = []
+    dropped = []
+    for _, row in df.iterrows():
+        ok, err = validate_image_file(row["filepath"])
+        if ok:
+            keep_rows.append(row.to_dict())
+        else:
+            dropped.append({
+                "filepath": row["filepath"],
+                "label": row["label"],
+                "reason": err,
+            })
+    out_df = pd.DataFrame(keep_rows)
+    if out_df.empty:
+        return out_df, dropped
+    out_df = out_df.reset_index(drop=True)
+    return out_df, dropped
+
+
+def list_image_files(root: Path):
+    return [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+
+
+def infer_dataset_structure(extract_dir: Path) -> pd.DataFrame:
+    files = list_image_files(extract_dir)
+    if not files:
+        raise ValueError("No image files found in the uploaded ZIP.")
+
+    rows = []
+    for fp in files:
+        parts = [x for x in fp.relative_to(extract_dir).parts]
+        lower_parts = [x.lower() for x in parts]
+
+        split = None
+        label = None
+
+        if len(parts) >= 2 and lower_parts[0] in {"train", "training", "val", "valid", "validation", "test"}:
+            split_map = {
+                "train": "train", "training": "train",
+                "val": "val", "valid": "val", "validation": "val",
+                "test": "test",
+            }
+            split = split_map[lower_parts[0]]
+            label = parts[1]
+        else:
+            # assume class folder is the first folder name
+            if len(parts) < 2:
+                continue
+            label = parts[0]
+
+        rows.append({"filepath": str(fp), "label": label, "split": split})
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise ValueError("ZIP structure is invalid. Expected class folders containing images.")
+
+    df = df[df["label"].notna()].copy()
+    counts = df["label"].value_counts()
+    valid_labels = counts[counts >= 2].index.tolist()
+    df = df[df["label"].isin(valid_labels)].reset_index(drop=True)
+
+    if df.empty:
+        raise ValueError("Each class must contain at least 2 images.")
+
+    return df
+
+
+def finalize_splits(df: pd.DataFrame, val_ratio: float, seed: int) -> pd.DataFrame:
+    df = df.copy()
+    if df["split"].notna().any():
+        # keep explicit train/val/test splits; if only train exists, create val from train
+        present = set(df["split"].dropna().unique().tolist())
+        if "val" not in present and "train" in present:
+            train_df = df[df["split"] == "train"].copy()
+            if train_df["label"].value_counts().min() >= 2 and len(train_df) >= len(train_df["label"].unique()) * 2:
+                tr_idx, va_idx = train_test_split(
+                    train_df.index,
+                    test_size=val_ratio,
+                    random_state=seed,
+                    stratify=train_df["label"],
+                )
+                df.loc[tr_idx, "split"] = "train"
+                df.loc[va_idx, "split"] = "val"
+        if "train" not in present:
+            non_test = df[df["split"] != "test"].copy()
+            tr_idx, va_idx = train_test_split(
+                non_test.index,
+                test_size=val_ratio,
+                random_state=seed,
+                stratify=non_test["label"],
+            )
+            df.loc[tr_idx, "split"] = "train"
+            df.loc[va_idx, "split"] = "val"
     else:
-        projects[idx] = project
-    save_projects(projects)
-    set_current_project(project)
+        tr_idx, va_idx = train_test_split(
+            df.index,
+            test_size=val_ratio,
+            random_state=seed,
+            stratify=df["label"],
+        )
+        df.loc[tr_idx, "split"] = "train"
+        df.loc[va_idx, "split"] = "val"
+
+    return df.reset_index(drop=True)
 
 
-# ============================================================
-# UI helpers (styling)
-# ============================================================
-def inject_css():
+def dataset_summary(df: pd.DataFrame) -> dict:
+    dims = []
+    broken = 0
+    for fp in df["filepath"].sample(min(len(df), 100), random_state=42).tolist():
+        try:
+            with Image.open(fp) as img:
+                dims.append(img.size)
+        except Exception:
+            broken += 1
+    width_stats = [d[0] for d in dims] if dims else [0]
+    height_stats = [d[1] for d in dims] if dims else [0]
+
+    return {
+        "total_images": int(len(df)),
+        "classes": int(df["label"].nunique()),
+        "splits": df["split"].value_counts().to_dict(),
+        "class_counts": df["label"].value_counts().to_dict(),
+        "width_min": int(np.min(width_stats)),
+        "width_max": int(np.max(width_stats)),
+        "height_min": int(np.min(height_stats)),
+        "height_max": int(np.max(height_stats)),
+        "sampled_broken_files": int(broken),
+    }
+
+
+def make_augmentation_layers(cfg):
+    tf = get_tf()
+    aug_cfg = cfg["augmentation"]
+    layers = [
+        tf.keras.layers.RandomFlip("horizontal") if aug_cfg["flip"] else tf.keras.layers.Lambda(lambda x: x),
+        tf.keras.layers.RandomRotation(aug_cfg["rotation"]) if aug_cfg["rotation"] > 0 else tf.keras.layers.Lambda(lambda x: x),
+        tf.keras.layers.RandomZoom(aug_cfg["zoom"]) if aug_cfg["zoom"] > 0 else tf.keras.layers.Lambda(lambda x: x),
+        tf.keras.layers.RandomContrast(aug_cfg["contrast"]) if aug_cfg["contrast"] > 0 else tf.keras.layers.Lambda(lambda x: x),
+    ]
+    return tf.keras.Sequential(layers, name="augmentation")
+
+
+def preprocess_input_layer(backbone: str):
+    tf = get_tf()
+    mapping = {
+        "MobileNetV2": tf.keras.applications.mobilenet_v2.preprocess_input,
+        "EfficientNetB0": tf.keras.applications.efficientnet.preprocess_input,
+        "ResNet50": tf.keras.applications.resnet.preprocess_input,
+    }
+    fn = mapping[backbone]
+    return tf.keras.layers.Lambda(fn, name="preprocess_input")
+
+
+def build_backbone(backbone_name: str, input_shape, weights="imagenet"):
+    tf = get_tf()
+    if backbone_name == "MobileNetV2":
+        return tf.keras.applications.MobileNetV2(
+            include_top=False,
+            weights=weights,
+            input_shape=input_shape,
+        )
+    if backbone_name == "EfficientNetB0":
+        return tf.keras.applications.EfficientNetB0(
+            include_top=False,
+            weights=weights,
+            input_shape=input_shape,
+        )
+    if backbone_name == "ResNet50":
+        return tf.keras.applications.ResNet50(
+            include_top=False,
+            weights=weights,
+            input_shape=input_shape,
+        )
+    raise ValueError(f"Unsupported backbone: {backbone_name}")
+
+def make_classification_loss(label_smoothing: float = 0.0):
+    tf = get_tf()
+    # Keep sparse integer labels for compatibility.
+    # Many TensorFlow/Keras builds do not accept label_smoothing here.
+    # So we intentionally ignore it instead of crashing the app.
+    _ = label_smoothing
+    return tf.keras.losses.SparseCategoricalCrossentropy()
+
+def build_model(class_names, cfg):
+    tf = get_tf()
+    img_size = int(cfg["image_size"])
+    input_shape = (img_size, img_size, 3)
+
+    inputs = tf.keras.Input(shape=input_shape, name="image")
+    x = make_augmentation_layers(cfg)(inputs)
+    x = preprocess_input_layer(cfg["backbone"])(x)
+
+    base_model = build_backbone(cfg["backbone"], input_shape, cfg["weights"])
+    if cfg["weights"] == "imagenet":
+        base_model.trainable = False
+    else:
+        base_model.trainable = True
+
+    x = base_model(x, training=False)
+    x = tf.keras.layers.Lambda(lambda t: t, name="backbone_feature_maps")(x)
+    x = tf.keras.layers.GlobalAveragePooling2D(name="gap")(x)
+    x = tf.keras.layers.BatchNormalization(name="head_bn")(x)
+    x = tf.keras.layers.Dense(cfg["dense_units"], activation="relu", name="head_dense")(x)
+    x = tf.keras.layers.Dropout(cfg["dropout"], name="head_dropout")(x)
+    outputs = tf.keras.layers.Dense(len(class_names), activation="softmax", name="predictions")(x)
+
+    model = tf.keras.Model(inputs, outputs, name="oil_gas_cnn")
+    opt = make_optimizer(cfg["optimizer"], cfg["learning_rate"])
+    metrics = [
+        "accuracy",
+        tf.keras.metrics.SparseTopKCategoricalAccuracy(k=min(3, len(class_names)), name="top_k_acc"),
+    ]
+    model.compile(
+        optimizer=opt,
+        loss=make_classification_loss(cfg.get("label_smoothing", 0.0)),
+        metrics=metrics,
+    )
+    return model, base_model
+
+
+def make_optimizer(name: str, lr: float):
+    tf = get_tf()
+    if name == "Adam":
+        return tf.keras.optimizers.Adam(learning_rate=lr)
+    if name == "RMSprop":
+        return tf.keras.optimizers.RMSprop(learning_rate=lr)
+    if name == "SGD":
+        return tf.keras.optimizers.SGD(learning_rate=lr, momentum=0.9, nesterov=True)
+    raise ValueError(f"Unsupported optimizer: {name}")
+
+
+def _load_image_with_pil(path_bytes, image_size: int, color_mode: str):
+    path = path_bytes.decode("utf-8")
+    with Image.open(path) as img:
+        img = ImageOps.exif_transpose(img)
+        if color_mode == "Grayscale → 3-channel":
+            img = ImageOps.grayscale(img).convert("RGB")
+        else:
+            img = img.convert("RGB")
+        img = img.resize((image_size, image_size), Image.Resampling.BILINEAR)
+        arr = np.asarray(img, dtype=np.float32)
+        if arr.ndim == 2:
+            arr = np.stack([arr, arr, arr], axis=-1)
+        if arr.shape[-1] == 4:
+            arr = arr[:, :, :3]
+        return arr
+
+
+def read_image_tf(path, label, image_size: int, color_mode: str):
+    tf = get_tf()
+    img = tf.numpy_function(
+        func=lambda p: _load_image_with_pil(p, image_size, color_mode),
+        inp=[path],
+        Tout=tf.float32,
+    )
+    img.set_shape([image_size, image_size, 3])
+    return img, label
+
+
+def make_tf_dataset(paths, labels, cfg, training: bool):
+    tf = get_tf()
+    ds = tf.data.Dataset.from_tensor_slices((paths, labels))
+    if training:
+        ds = ds.shuffle(min(len(paths), cfg["shuffle_buffer"]), seed=cfg["seed"], reshuffle_each_iteration=True)
+    ds = ds.map(
+        lambda x, y: read_image_tf(x, y, cfg["image_size"], cfg["color_mode"]),
+        num_parallel_calls=tf.data.AUTOTUNE,
+    )
+    ds = ds.batch(cfg["batch_size"]).prefetch(tf.data.AUTOTUNE)
+    return ds
+
+
+class EpochHistoryCallback:
+    def __init__(self):
+        self.rows = []
+
+    def as_keras_callback(self):
+        tf = get_tf()
+        outer = self
+
+        class _CB(tf.keras.callbacks.Callback):
+            def on_epoch_end(self, epoch, logs=None):
+                logs = logs or {}
+                lr = float(tf.keras.backend.get_value(self.model.optimizer.learning_rate))
+                row = {"epoch": int(epoch + 1), "lr": lr}
+                for k, v in logs.items():
+                    try:
+                        row[k] = float(v)
+                    except Exception:
+                        pass
+                outer.rows.append(row)
+
+        return _CB()
+
+
+def combine_histories(h1: dict, h2: dict):
+    if not h1:
+        return h2
+    if not h2:
+        return h1
+    out = {}
+    keys = sorted(set(h1.keys()) | set(h2.keys()))
+    for k in keys:
+        out[k] = list(h1.get(k, [])) + list(h2.get(k, []))
+    return out
+
+
+def compute_class_weights_from_labels(y):
+    classes = np.unique(y)
+    weights = compute_class_weight(class_weight="balanced", classes=classes, y=y)
+    return {int(c): float(w) for c, w in zip(classes, weights)}
+
+
+def evaluate_model(model, val_df: pd.DataFrame, class_names, cfg):
+    tf = get_tf()
+    label_to_idx = {c: i for i, c in enumerate(class_names)}
+    y_true = val_df["label"].map(label_to_idx).astype(int).to_numpy()
+    paths = val_df["filepath"].tolist()
+    ds = make_tf_dataset(paths, y_true, cfg, training=False)
+    probs = model.predict(ds, verbose=0)
+    preds = probs.argmax(axis=1)
+
+    metrics = {
+        "accuracy": float(accuracy_score(y_true, preds)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, preds)),
+        "precision_macro": float(precision_score(y_true, preds, average="macro", zero_division=0)),
+        "recall_macro": float(recall_score(y_true, preds, average="macro", zero_division=0)),
+        "f1_macro": float(f1_score(y_true, preds, average="macro", zero_division=0)),
+    }
+    try:
+        metrics["log_loss"] = float(log_loss(y_true, probs, labels=np.arange(len(class_names))))
+    except Exception:
+        metrics["log_loss"] = None
+
+    y_bin = label_binarize(y_true, classes=np.arange(len(class_names)))
+    roc_info = {}
+    pr_info = {}
+
+    if len(class_names) == 2:
+        fpr, tpr, _ = roc_curve(y_true, probs[:, 1])
+        precision, recall, _ = precision_recall_curve(y_true, probs[:, 1])
+        roc_info["binary"] = {"fpr": fpr.tolist(), "tpr": tpr.tolist(), "auc": float(auc(fpr, tpr))}
+        pr_info["binary"] = {
+            "precision": precision.tolist(),
+            "recall": recall.tolist(),
+            "ap": float(average_precision_score(y_true, probs[:, 1])),
+        }
+        try:
+            metrics["roc_auc"] = float(roc_auc_score(y_true, probs[:, 1]))
+        except Exception:
+            metrics["roc_auc"] = None
+    else:
+        try:
+            metrics["roc_auc_ovr_macro"] = float(roc_auc_score(y_bin, probs, multi_class="ovr", average="macro"))
+        except Exception:
+            metrics["roc_auc_ovr_macro"] = None
+        try:
+            metrics["ap_macro"] = float(average_precision_score(y_bin, probs, average="macro"))
+        except Exception:
+            metrics["ap_macro"] = None
+
+        for i, cname in enumerate(class_names):
+            try:
+                fpr, tpr, _ = roc_curve(y_bin[:, i], probs[:, i])
+                precision, recall, _ = precision_recall_curve(y_bin[:, i], probs[:, i])
+                roc_info[cname] = {"fpr": fpr.tolist(), "tpr": tpr.tolist(), "auc": float(auc(fpr, tpr))}
+                pr_info[cname] = {
+                    "precision": precision.tolist(),
+                    "recall": recall.tolist(),
+                    "ap": float(average_precision_score(y_bin[:, i], probs[:, i])),
+                }
+            except Exception:
+                pass
+
+    cm = confusion_matrix(y_true, preds)
+    report = classification_report(
+        y_true,
+        preds,
+        target_names=class_names,
+        zero_division=0,
+        output_dict=True,
+    )
+
+    return {
+        "metrics": metrics,
+        "y_true": y_true,
+        "y_pred": preds,
+        "y_prob": probs,
+        "class_names": class_names,
+        "confusion_matrix": cm,
+        "classification_report": report,
+        "val_paths": paths,
+        "roc_info": roc_info,
+        "pr_info": pr_info,
+    }
+
+
+def find_last_conv_layer_name(model):
+    # We expose the backbone feature map explicitly to make Grad-CAM robust
+    # even when the backbone itself is a nested sub-model.
+    try:
+        model.get_layer("backbone_feature_maps")
+        return "backbone_feature_maps"
+    except Exception:
+        return None
+
+
+def prepare_single_image(img: Image.Image, cfg):
+    tf = get_tf()
+    img = ensure_rgb(img, "RGB" if cfg["color_mode"] == "RGB" else "GRAY")
+    img = img.resize((cfg["image_size"], cfg["image_size"]))
+    arr = np.array(img).astype("float32")
+    if cfg["color_mode"] == "Grayscale → 3-channel":
+        gray = np.mean(arr, axis=-1, keepdims=True)
+        arr = np.concatenate([gray, gray, gray], axis=-1)
+    arr = np.expand_dims(arr, axis=0)
+    return arr
+
+
+def render_uploaded_images_section(
+    uploader_label="Upload image(s)",
+    uploader_key="shared_image_uploader",
+    show_title=True,
+    show_gradcam=True,
+):
+    cfg = st.session_state.model_config
+    model = st.session_state.trained_model
+    class_names = st.session_state.class_names
+
+    uploaded_imgs = st.file_uploader(
+        uploader_label,
+        accept_multiple_files=True,
+        key=uploader_key,
+        help="JPG, JPEG, PNG, BMP, TIFF, WEBP, and GIF work best. HEIC/HEIF usually require conversion unless extra codecs are installed.",
+    )
+
+    if not uploaded_imgs:
+        return
+
+    st.session_state.last_uploaded_images = [up.name for up in uploaded_imgs]
+
+    if show_title:
+        st.write("### Uploaded Images")
+
+    if model is None or not st.session_state.training_complete or not class_names:
+        st.info("Images uploaded successfully. Prediction is locked until you train or load a model.")
+        preview_cols = st.columns(5, gap="small")
+        for i, up in enumerate(uploaded_imgs):
+            try:
+                img, err = open_uploaded_image(up)
+                if err:
+                    preview_cols[i % len(preview_cols)].error(err)
+                else:
+                    preview_cols[i % len(preview_cols)].image(img, caption=up.name, use_container_width=True)
+            except Exception as e:
+                preview_cols[i % len(preview_cols)].error(f"{up.name}: {e}")
+        return
+
+    rows = []
+    for up in uploaded_imgs:
+        try:
+            img, err = open_uploaded_image(up)
+            if err:
+                raise ValueError(err)
+            clean_img = ensure_rgb(img, "RGB" if cfg["color_mode"] == "RGB" else "GRAY")
+            arr = prepare_single_image(clean_img, cfg)
+            probs = model.predict(arr, verbose=0)[0]
+            pred_idx = int(np.argmax(probs))
+            pred_name = class_names[pred_idx]
+            top_indices = np.argsort(probs)[::-1][:min(5, len(class_names))]
+            heatmap = gradcam_heatmap(model, arr) if show_gradcam else None
+            overlay = None
+            if heatmap is not None:
+                overlay = overlay_heatmap_on_image(
+                    clean_img.resize((cfg["image_size"], cfg["image_size"])),
+                    heatmap,
+                )
+            rows.append({
+                "filename": up.name,
+                "predicted_class": pred_name,
+                "confidence": float(probs[pred_idx]),
+                "top_k": {class_names[i]: float(probs[i]) for i in top_indices},
+                "image": clean_img,
+                "overlay": overlay,
+            })
+        except Exception as e:
+            rows.append({
+                "filename": up.name,
+                "error": str(e),
+            })
+
+    valid_rows = [row for row in rows if "error" not in row]
+    if valid_rows:
+        summary_df = pd.DataFrame({
+            "filename": [r["filename"] for r in valid_rows],
+            "predicted_class": [r["predicted_class"] for r in valid_rows],
+            "confidence": [r["confidence"] for r in valid_rows],
+        }).sort_values("confidence", ascending=False)
+        st.write("### Prediction Summary")
+        st.dataframe(summary_df, use_container_width=True)
+
+    for row in rows:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        if "error" in row:
+            st.error(f"{row['filename']}: {row['error']}")
+            st.markdown("</div>", unsafe_allow_html=True)
+            continue
+
+        c1, c2 = st.columns([0.9, 1.1], gap="small")
+        with c1:
+            st.image(row["image"], caption=row["filename"], use_container_width=True)
+        with c2:
+            st.write(f"**Predicted Class:** {row['predicted_class']}")
+            st.write(f"**Confidence:** {row['confidence']:.4f}")
+            prob_df = pd.DataFrame({
+                "class": list(row["top_k"].keys()),
+                "probability": list(row["top_k"].values())
+            })
+            st.dataframe(prob_df, use_container_width=True)
+
+            fig, ax = plt.subplots(figsize=(3.8, 2.0))
+            ax.bar(prob_df["class"], prob_df["probability"])
+            ax.set_title("Top Class Probabilities")
+            ax.set_ylim(0, 1.0)
+            ax.tick_params(axis="x", rotation=45)
+            fig.tight_layout()
+            fig_show(fig)
+
+            if row.get("overlay") is not None:
+                st.write("**Grad-CAM**")
+                st.image(row["overlay"], use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+def gradcam_heatmap(model, img_array, layer_name=None):
+    tf = get_tf()
+    if layer_name is None:
+        layer_name = find_last_conv_layer_name(model)
+    if layer_name is None:
+        return None
+
+    grad_model = tf.keras.models.Model(
+        [model.inputs],
+        [model.get_layer(layer_name).output, model.output]
+    )
+
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(img_array)
+        pred_index = tf.argmax(predictions[0])
+        class_channel = predictions[:, pred_index]
+
+    grads = tape.gradient(class_channel, conv_outputs)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    conv_outputs = conv_outputs[0]
+    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
+    heatmap = tf.squeeze(heatmap)
+    heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-8)
+    return heatmap.numpy()
+
+
+def overlay_heatmap_on_image(base_img: Image.Image, heatmap, alpha=0.40):
+    if heatmap is None:
+        return None
+    heatmap = np.uint8(255 * heatmap)
+    cmap = plt.get_cmap("jet")
+    colored = cmap(heatmap)[:, :, :3]
+    colored = Image.fromarray(np.uint8(colored * 255)).resize(base_img.size)
+    base = base_img.convert("RGB")
+    return Image.blend(base, colored, alpha=alpha)
+
+
+def extract_features(model, paths, cfg, batch_limit=256):
+    tf = get_tf()
+    feature_model = tf.keras.Model(inputs=model.input, outputs=model.get_layer("gap").output)
+    labels_dummy = np.zeros(len(paths), dtype=np.int32)
+    ds = make_tf_dataset(paths[:batch_limit], labels_dummy[:batch_limit], cfg, training=False)
+    feats = feature_model.predict(ds, verbose=0)
+    return feats
+
+
+def save_project(project_name: str):
+    if st.session_state.trained_model is None:
+        raise ValueError("No trained model available to save.")
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    project_dir = MODEL_DIR / f"{project_name}_{ts}"
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    model_path = project_dir / "model.keras"
+    meta_path = project_dir / "metadata.joblib"
+
+    st.session_state.trained_model.save(model_path)
+
+    meta = {
+        "saved_at": now_str(),
+        "project_name": project_name,
+        "class_names": st.session_state.class_names,
+        "model_config": st.session_state.model_config,
+        "history": st.session_state.history,
+        "data_summary": st.session_state.data_summary,
+        "eval_artifacts": st.session_state.eval_artifacts,
+    }
+    joblib.dump(meta, meta_path)
+    return project_dir
+
+
+def load_project(project_dir: Path):
+    tf = get_tf()
+    model_path = project_dir / "model.keras"
+    meta_path = project_dir / "metadata.joblib"
+    if not model_path.exists() or not meta_path.exists():
+        raise FileNotFoundError("Selected project is missing model.keras or metadata.joblib.")
+
+    model = tf.keras.models.load_model(model_path)
+    meta = joblib.load(meta_path)
+
+    st.session_state.trained_model = model
+    st.session_state.project_name = meta.get("project_name", project_dir.name)
+    st.session_state.class_names = meta.get("class_names", [])
+    st.session_state.model_config = meta.get("model_config", st.session_state.model_config)
+    st.session_state.history = meta.get("history", None)
+    st.session_state.data_summary = meta.get("data_summary", {})
+    st.session_state.eval_artifacts = meta.get("eval_artifacts", None)
+    st.session_state.training_complete = True
+    st.session_state.loaded_project_path = str(project_dir)
+
+
+def available_projects():
+    dirs = [p for p in MODEL_DIR.iterdir() if p.is_dir()]
+    return sorted(dirs, key=lambda x: x.stat().st_mtime, reverse=True)
+
+
+# -----------------------------
+# Plotting
+# -----------------------------
+def plot_class_distribution(df: pd.DataFrame):
+    counts = df["label"].value_counts().sort_values(ascending=False)
+    fig, ax = plt.subplots(figsize=(4.6, 2.3))
+    counts.plot(kind="bar", ax=ax)
+    ax.set_title("Class Distribution")
+    ax.set_ylabel("Images")
+    ax.set_xlabel("Class")
+    ax.tick_params(axis="x", rotation=45)
+    fig.tight_layout()
+    fig_show(fig)
+
+
+def plot_image_dimensions(df: pd.DataFrame):
+    sample = df.sample(min(len(df), 150), random_state=42)
+    widths, heights = [], []
+    for fp in sample["filepath"]:
+        try:
+            with Image.open(fp) as img:
+                widths.append(img.size[0])
+                heights.append(img.size[1])
+        except Exception:
+            pass
+
+    if not widths:
+        st.warning("Could not inspect image dimensions.")
+        return
+
+    fig, ax = plt.subplots(figsize=(4.2, 2.5))
+    ax.scatter(widths, heights, alpha=0.7)
+    ax.set_title("Image Width vs Height")
+    ax.set_xlabel("Width")
+    ax.set_ylabel("Height")
+    fig.tight_layout()
+    fig_show(fig)
+
+
+def show_sample_gallery(df: pd.DataFrame, n_per_class=5):
+    classes = df["label"].unique().tolist()
+    for cname in classes:
+        sub = df[df["label"] == cname].sample(min(n_per_class, (df["label"] == cname).sum()), random_state=42)
+        st.markdown(f"**{cname}**")
+        cols = st.columns(n_per_class, gap="small")
+        for i, (_, row) in enumerate(sub.iterrows()):
+            with Image.open(row["filepath"]) as img:
+                cols[min(i, n_per_class - 1)].image(img, use_container_width=True, caption=Path(row["filepath"]).name)
+
+
+def plot_training_curves(history: dict):
+    if not history:
+        st.warning("No training history available.")
+        return
+
+    df = pd.DataFrame(history)
+    if df.empty:
+        st.warning("Training history is empty.")
+        return
+
+    col1, col2 = st.columns(2, gap="small")
+
+    with col1:
+        fig, ax = plt.subplots(figsize=(4.0, 2.4))
+        if "loss" in df:
+            ax.plot(df.index + 1, df["loss"], label="Train Loss")
+        if "val_loss" in df:
+            ax.plot(df.index + 1, df["val_loss"], label="Val Loss")
+            best_idx = int(df["val_loss"].idxmin()) + 1
+            ax.axvline(best_idx, linestyle="--", alpha=0.7, label=f"Best Val Epoch {best_idx}")
+        ax.set_title("Training Loss")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        ax.legend()
+        fig.tight_layout()
+        fig_show(fig)
+
+    with col2:
+        fig, ax = plt.subplots(figsize=(4.0, 2.4))
+        if "accuracy" in df:
+            ax.plot(df.index + 1, df["accuracy"], label="Train Accuracy")
+        if "val_accuracy" in df:
+            ax.plot(df.index + 1, df["val_accuracy"], label="Val Accuracy")
+        ax.set_title("Accuracy")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Accuracy")
+        ax.legend()
+        fig.tight_layout()
+        fig_show(fig)
+
+    if "lr" in df:
+        fig, ax = plt.subplots(figsize=(4.2, 2.0))
+        ax.plot(df.index + 1, df["lr"])
+        ax.set_title("Learning Rate by Epoch")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Learning Rate")
+        fig.tight_layout()
+        fig_show(fig)
+
+
+def plot_confusion_matrices(cm, class_names):
+    cm = np.asarray(cm)
+    cm_norm = cm.astype(float) / np.maximum(cm.sum(axis=1, keepdims=True), 1)
+
+    col1, col2 = st.columns(2, gap="small")
+
+    with col1:
+        fig, ax = plt.subplots(figsize=(3.6, 3.2))
+        im = ax.imshow(cm, interpolation="nearest")
+        ax.set_title("Confusion Matrix")
+        ax.set_xticks(np.arange(len(class_names)))
+        ax.set_xticklabels(class_names, rotation=45, ha="right")
+        ax.set_yticks(np.arange(len(class_names)))
+        ax.set_yticklabels(class_names)
+        thresh = cm.max() / 2 if cm.size else 0
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                ax.text(j, i, int(cm[i, j]), ha="center", va="center",
+                        color="white" if cm[i, j] > thresh else "black")
+        ax.set_ylabel("True")
+        ax.set_xlabel("Predicted")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        fig.tight_layout()
+        fig_show(fig)
+
+    with col2:
+        fig, ax = plt.subplots(figsize=(3.6, 3.2))
+        im = ax.imshow(cm_norm, interpolation="nearest", vmin=0.0, vmax=1.0)
+        ax.set_title("Normalized Confusion Matrix")
+        ax.set_xticks(np.arange(len(class_names)))
+        ax.set_xticklabels(class_names, rotation=45, ha="right")
+        ax.set_yticks(np.arange(len(class_names)))
+        ax.set_yticklabels(class_names)
+        thresh = cm_norm.max() / 2 if cm_norm.size else 0
+        for i in range(cm_norm.shape[0]):
+            for j in range(cm_norm.shape[1]):
+                ax.text(j, i, f"{cm_norm[i, j]:.2f}", ha="center", va="center",
+                        color="white" if cm_norm[i, j] > thresh else "black")
+        ax.set_ylabel("True")
+        ax.set_xlabel("Predicted")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        fig.tight_layout()
+        fig_show(fig)
+
+
+def plot_per_class_metrics(report_dict, class_names):
+    rows = []
+    for cname in class_names:
+        if cname in report_dict:
+            rows.append({
+                "class": cname,
+                "precision": report_dict[cname]["precision"],
+                "recall": report_dict[cname]["recall"],
+                "f1-score": report_dict[cname]["f1-score"],
+                "support": report_dict[cname]["support"],
+            })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        st.warning("No per-class metrics available.")
+        return
+
+    st.dataframe(df, use_container_width=True)
+
+    fig, ax = plt.subplots(figsize=(4.8, 2.5))
+    x = np.arange(len(df))
+    w = 0.25
+    ax.bar(x - w, df["precision"], width=w, label="Precision")
+    ax.bar(x, df["recall"], width=w, label="Recall")
+    ax.bar(x + w, df["f1-score"], width=w, label="F1")
+    ax.set_xticks(x)
+    ax.set_xticklabels(df["class"], rotation=45, ha="right")
+    ax.set_ylim(0, 1.05)
+    ax.set_title("Per-Class Metrics")
+    ax.legend()
+    fig.tight_layout()
+    fig_show(fig)
+
+
+def plot_roc_pr(eval_artifacts):
+    roc_info = eval_artifacts["roc_info"]
+    pr_info = eval_artifacts["pr_info"]
+    class_names = eval_artifacts["class_names"]
+
+    col1, col2 = st.columns(2, gap="small")
+
+    with col1:
+        fig, ax = plt.subplots(figsize=(4.0, 2.5))
+        if "binary" in roc_info:
+            d = roc_info["binary"]
+            ax.plot(d["fpr"], d["tpr"], label=f"AUC = {d['auc']:.3f}")
+        else:
+            for cname in class_names:
+                if cname in roc_info:
+                    d = roc_info[cname]
+                    ax.plot(d["fpr"], d["tpr"], label=f"{cname} ({d['auc']:.2f})")
+        ax.plot([0, 1], [0, 1], linestyle="--", alpha=0.6)
+        ax.set_title("ROC Curve")
+        ax.set_xlabel("False Positive Rate")
+        ax.set_ylabel("True Positive Rate")
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        fig_show(fig)
+
+    with col2:
+        fig, ax = plt.subplots(figsize=(4.0, 2.5))
+        if "binary" in pr_info:
+            d = pr_info["binary"]
+            ax.plot(d["recall"], d["precision"], label=f"AP = {d['ap']:.3f}")
+        else:
+            for cname in class_names:
+                if cname in pr_info:
+                    d = pr_info[cname]
+                    ax.plot(d["recall"], d["precision"], label=f"{cname} ({d['ap']:.2f})")
+        ax.set_title("Precision-Recall Curve")
+        ax.set_xlabel("Recall")
+        ax.set_ylabel("Precision")
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        fig_show(fig)
+
+
+def show_misclassified(eval_artifacts, max_items=12):
+    y_true = np.asarray(eval_artifacts["y_true"])
+    y_pred = np.asarray(eval_artifacts["y_pred"])
+    probs = np.asarray(eval_artifacts["y_prob"])
+    paths = eval_artifacts["val_paths"]
+    class_names = eval_artifacts["class_names"]
+
+    wrong = np.where(y_true != y_pred)[0]
+    if len(wrong) == 0:
+        st.success("No misclassified validation samples found.")
+        return
+
+    selected = wrong[:max_items]
+    cols = st.columns(6, gap="small")
+    for i, idx in enumerate(selected):
+        with Image.open(paths[idx]) as img:
+            prob = probs[idx, y_pred[idx]]
+            cols[i % len(cols)].image(
+                img,
+                caption=f"True: {class_names[y_true[idx]]}\nPred: {class_names[y_pred[idx]]}\nConf: {prob:.3f}",
+                use_container_width=True
+            )
+
+
+def plot_embedding_map(model, eval_artifacts, cfg):
+    paths = eval_artifacts["val_paths"]
+    y_true = np.asarray(eval_artifacts["y_true"])
+    class_names = eval_artifacts["class_names"]
+    feats = extract_features(model, paths, cfg, batch_limit=min(len(paths), 256))
+    if feats.shape[0] < 3:
+        st.warning("Not enough samples to compute PCA embedding.")
+        return
+    pca = PCA(n_components=2, random_state=42)
+    emb = pca.fit_transform(feats)
+
+    fig, ax = plt.subplots(figsize=(4.3, 3.0))
+    for i, cname in enumerate(class_names):
+        mask = y_true[:len(emb)] == i
+        ax.scatter(emb[mask, 0], emb[mask, 1], label=cname, alpha=0.75)
+    ax.set_title("Validation Feature Embedding (PCA)")
+    ax.set_xlabel("PC 1")
+    ax.set_ylabel("PC 2")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig_show(fig)
+
+
+# -----------------------------
+# Pages
+# -----------------------------
+def page_home():
+    hero()
+    status_bar()
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.subheader("What this app is for")
+    st.write(
+        """
+        Use this for oil & gas image classification tasks such as:
+        - seismic facies or fault-image classes
+        - core / thin-section rock imagery
+        - corrosion / coating / crack / anomaly inspection
+        - equipment condition images
+        - refinery / field visual inspection categories
+        """
+    )
+    st.write(
+        """
+        Do **not** use this for plain tabular well-log spreadsheets. CNNs are for images or structured 2D grids.
+        """
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Required Input", "ZIP image dataset")
+    c2.metric("Task Type", "Image classification")
+    c3.metric("Deployment Output", "Saved .keras model")
+
+    with st.expander("Expected ZIP structure", expanded=True):
+        st.code(
+            """Option A (explicit split)
+dataset.zip
+├── train
+│   ├── class_1
+│   │   ├── img001.jpg
+│   │   └── ...
+│   └── class_2
+├── val
+│   ├── class_1
+│   └── class_2
+
+Option B (single folder, app creates validation split)
+dataset.zip
+├── class_1
+│   ├── img001.jpg
+│   └── ...
+└── class_2
+    ├── img101.jpg
+    └── ...
+""",
+            language="text"
+        )
+
+
+def page_data_upload():
+    hero()
+    status_bar()
+    st.subheader("Data Upload")
+
+    cfg = st.session_state.model_config
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        st.session_state.project_name = st.text_input("Project Name", value=st.session_state.project_name)
+    with col2:
+        cfg["val_ratio"] = st.slider("Validation Ratio", 0.1, 0.4, float(cfg["val_ratio"]), 0.05)
+
+    st.write("### Upload Dataset ZIP")
+    uploaded_zip = st.file_uploader("Upload ZIP dataset for training", type=["zip"], key="dataset_zip_uploader")
+
+    if uploaded_zip is not None:
+        if st.button("Load Dataset", type="primary", use_container_width=True):
+            with st.spinner("Extracting and indexing dataset..."):
+                seed_everything(cfg["seed"])
+                extract_dir = save_uploaded_zip(uploaded_zip, st.session_state.project_name)
+                df = infer_dataset_structure(extract_dir)
+                df, dropped_files = filter_valid_images(df)
+                if df.empty:
+                    raise ValueError("No valid readable images were found after validation. Remove corrupted, unsupported, or HEIC/HEIF files and try again.")
+                counts = df["label"].value_counts()
+                valid_labels = counts[counts >= 2].index.tolist()
+                df = df[df["label"].isin(valid_labels)].reset_index(drop=True)
+                if df.empty:
+                    raise ValueError("After removing invalid images, each class must still contain at least 2 readable images.")
+                df = finalize_splits(df, cfg["val_ratio"], cfg["seed"])
+                st.session_state.dataset_root = str(extract_dir)
+                st.session_state.dataset_df = df
+                st.session_state.class_names = sorted(df["label"].unique().tolist())
+                st.session_state.data_summary = dataset_summary(df)
+                st.session_state.training_complete = False
+                st.session_state.trained_model = None
+                st.session_state.history = None
+                st.session_state.eval_artifacts = None
+                st.session_state.invalid_dataset_files = dropped_files
+            st.success("Dataset loaded successfully.")
+            if st.session_state.get("invalid_dataset_files"):
+                dropped_df = pd.DataFrame(st.session_state.invalid_dataset_files)
+                st.warning(f"Ignored {len(dropped_df)} unreadable/unsupported image files from the ZIP.")
+                st.dataframe(dropped_df.head(20), use_container_width=True)
+
+    st.divider()
+    st.write("### Upload Single or Multiple Images")
+    st.caption("This uploader is separate from the ZIP dataset uploader. Use it for one picture or many pictures. If a trained model exists, prediction runs immediately. Otherwise the app just previews the images.")
+    render_uploaded_images_section(
+        uploader_label="Upload image files",
+        uploader_key="data_page_image_uploader",
+        show_title=False,
+        show_gradcam=True,
+    )
+
+    df = st.session_state.dataset_df
+    if df is not None:
+        st.write("### Dataset Preview")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Images", len(df))
+        c2.metric("Classes", df["label"].nunique())
+        c3.metric("Train", int((df["split"] == "train").sum()))
+        c4.metric("Validation", int((df["split"] == "val").sum()))
+
+        st.dataframe(df.head(20), use_container_width=True)
+
+        col1, col2 = st.columns([1.0, 1.0], gap="small")
+        with col1:
+            plot_class_distribution(df)
+        with col2:
+            plot_image_dimensions(df)
+
+        st.write("### Sample Gallery")
+        show_sample_gallery(df, n_per_class=5)
+
+def page_model():
+    hero()
+    status_bar()
+    st.subheader("Model")
+
+    cfg = st.session_state.model_config
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        cfg["backbone"] = st.selectbox("Backbone", ["MobileNetV2", "EfficientNetB0", "ResNet50"],
+                                       index=["MobileNetV2", "EfficientNetB0", "ResNet50"].index(cfg["backbone"]))
+        cfg["weights"] = st.selectbox("Initial Weights", ["imagenet", None], index=0 if cfg["weights"] == "imagenet" else 1)
+        cfg["optimizer"] = st.selectbox("Optimizer", ["Adam", "RMSprop", "SGD"],
+                                        index=["Adam", "RMSprop", "SGD"].index(cfg["optimizer"]))
+    with c2:
+        cfg["dense_units"] = st.select_slider("Dense Units", options=[64, 128, 256, 512], value=cfg["dense_units"])
+        cfg["dropout"] = st.slider("Dropout", 0.0, 0.7, float(cfg["dropout"]), 0.05)
+        cfg["label_smoothing"] = 0.0
+        st.caption("Label smoothing is disabled to keep sparse-label training compatible with your TensorFlow/Keras build.")
+    with c3:
+        cfg["learning_rate"] = st.select_slider("Learning Rate", options=[1e-4, 3e-4, 1e-3, 3e-3], value=cfg["learning_rate"])
+        cfg["fine_tune"] = st.checkbox("Enable Fine-Tuning", value=cfg["fine_tune"])
+        cfg["use_class_weights"] = st.checkbox("Use Class Weights", value=cfg["use_class_weights"])
+
+    if cfg["fine_tune"]:
+        c4, c5 = st.columns(2)
+        with c4:
+            cfg["unfreeze_layers"] = st.slider("Unfreeze Last N Layers", 5, 120, int(cfg["unfreeze_layers"]), 5)
+        with c5:
+            cfg["fine_tune_lr"] = st.select_slider("Fine-Tune LR", options=[1e-6, 3e-6, 1e-5, 3e-5, 1e-4], value=cfg["fine_tune_lr"])
+
+    st.info("Recommended starting point for small oil & gas image datasets: MobileNetV2 + ImageNet weights + fine-tuning.")
+
+
+def page_preprocess():
+    hero()
+    status_bar()
+    st.subheader("Preprocess")
+
+    cfg = st.session_state.model_config
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        cfg["image_size"] = st.selectbox("Input Size", [160, 192, 224, 256, 300],
+                                         index=[160, 192, 224, 256, 300].index(cfg["image_size"]))
+        cfg["batch_size"] = st.selectbox("Batch Size", [8, 16, 24, 32, 48],
+                                         index=[8, 16, 24, 32, 48].index(cfg["batch_size"]))
+    with c2:
+        cfg["color_mode"] = st.selectbox("Color Mode", ["RGB", "Grayscale → 3-channel"],
+                                         index=0 if cfg["color_mode"] == "RGB" else 1)
+        cfg["seed"] = st.number_input("Seed", 1, 999999, int(cfg["seed"]))
+    with c3:
+        cfg["shuffle_buffer"] = st.selectbox("Shuffle Buffer", [256, 512, 1024, 2048],
+                                             index=[256, 512, 1024, 2048].index(cfg["shuffle_buffer"]))
+
+    st.write("### Augmentation")
+    a1, a2, a3, a4 = st.columns(4)
+    aug = cfg["augmentation"]
+    with a1:
+        aug["flip"] = st.checkbox("Horizontal Flip", value=aug["flip"])
+    with a2:
+        aug["rotation"] = st.slider("Rotation", 0.0, 0.25, float(aug["rotation"]), 0.01)
+    with a3:
+        aug["zoom"] = st.slider("Zoom", 0.0, 0.30, float(aug["zoom"]), 0.01)
+    with a4:
+        aug["contrast"] = st.slider("Contrast", 0.0, 0.30, float(aug["contrast"]), 0.01)
+
+    st.caption("These augmentations mimic the standard MATLAB-style image pipeline: resize, random transform, transfer learn.")
+
+
+def page_train():
+    hero()
+    status_bar()
+    st.subheader("Train")
+
+    df = st.session_state.dataset_df
+    cfg = st.session_state.model_config
+    if df is None:
+        st.warning("Upload a dataset first.")
+        return
+
+    train_df = df[df["split"] == "train"].copy()
+    val_df = df[df["split"] == "val"].copy()
+
+    if train_df.empty or val_df.empty:
+        st.error("Training or validation split is empty.")
+        return
+
+    c1, c2 = st.columns(2)
+    with c1:
+        cfg["epochs_stage1"] = st.slider("Stage 1 Epochs (Frozen Backbone)", 1, 40, int(cfg["epochs_stage1"]))
+    with c2:
+        cfg["epochs_stage2"] = st.slider("Stage 2 Epochs (Fine-Tuning)", 0, 30, int(cfg["epochs_stage2"]))
+
+    if st.button("Start Training", type="primary", use_container_width=True):
+        with st.spinner("Training model..."):
+            seed_everything(cfg["seed"])
+            class_names = sorted(st.session_state.class_names)
+            label_to_idx = {c: i for i, c in enumerate(class_names)}
+
+            y_train = train_df["label"].map(label_to_idx).astype(int).to_numpy()
+            y_val = val_df["label"].map(label_to_idx).astype(int).to_numpy()
+
+            train_ds = make_tf_dataset(train_df["filepath"].tolist(), y_train, cfg, training=True)
+            val_ds = make_tf_dataset(val_df["filepath"].tolist(), y_val, cfg, training=False)
+
+            model, base_model = build_model(class_names, cfg)
+
+            tf = get_tf()
+            callbacks = [
+                tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=4, restore_best_weights=True),
+                tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.3, patience=2, min_lr=1e-7),
+            ]
+            hist_cb_1 = EpochHistoryCallback()
+            callbacks_all_1 = callbacks + [hist_cb_1.as_keras_callback()]
+
+            class_weights = compute_class_weights_from_labels(y_train) if cfg["use_class_weights"] else None
+
+            hist1 = model.fit(
+                train_ds,
+                validation_data=val_ds,
+                epochs=cfg["epochs_stage1"],
+                callbacks=callbacks_all_1,
+                verbose=1,
+                class_weight=class_weights,
+            )
+
+            merged_history = hist1.history.copy()
+            epoch_rows = hist_cb_1.rows.copy()
+
+            if cfg["fine_tune"] and cfg["epochs_stage2"] > 0 and cfg["weights"] == "imagenet":
+                base_model.trainable = True
+                for layer in base_model.layers[:-cfg["unfreeze_layers"]]:
+                    layer.trainable = False
+
+                model.compile(
+                    optimizer=make_optimizer(cfg["optimizer"], cfg["fine_tune_lr"]),
+                    loss=make_classification_loss(cfg.get("label_smoothing", 0.0)),
+                    metrics=["accuracy", tf.keras.metrics.SparseTopKCategoricalAccuracy(k=min(3, len(class_names)), name="top_k_acc")],
+                )
+
+                hist_cb_2 = EpochHistoryCallback()
+                callbacks_all_2 = callbacks + [hist_cb_2.as_keras_callback()]
+
+                hist2 = model.fit(
+                    train_ds,
+                    validation_data=val_ds,
+                    epochs=cfg["epochs_stage1"] + cfg["epochs_stage2"],
+                    initial_epoch=cfg["epochs_stage1"],
+                    callbacks=callbacks_all_2,
+                    verbose=1,
+                    class_weight=class_weights,
+                )
+                merged_history = combine_histories(hist1.history, hist2.history)
+                epoch_rows.extend(hist_cb_2.rows)
+
+            if epoch_rows:
+                hist_df = pd.DataFrame(epoch_rows).sort_values("epoch")
+                merged_history["lr"] = hist_df["lr"].tolist()
+
+            st.session_state.trained_model = model
+            st.session_state.history = merged_history
+            st.session_state.eval_artifacts = evaluate_model(model, val_df, class_names, cfg)
+            st.session_state.training_complete = True
+
+        st.success("Training complete.")
+
+    if st.session_state.history is not None:
+        plot_training_curves(st.session_state.history)
+
+
+def page_evaluate():
+    hero()
+    status_bar()
+    st.subheader("Evaluate")
+
+    if not st.session_state.training_complete or st.session_state.eval_artifacts is None:
+        st.warning("Train or load a model first.")
+        return
+
+    ev = st.session_state.eval_artifacts
+    metrics = ev["metrics"]
+
+    cols = st.columns(6)
+    items = [
+        ("Accuracy", metrics.get("accuracy")),
+        ("Balanced Acc", metrics.get("balanced_accuracy")),
+        ("Precision Macro", metrics.get("precision_macro")),
+        ("Recall Macro", metrics.get("recall_macro")),
+        ("F1 Macro", metrics.get("f1_macro")),
+        ("Log Loss", metrics.get("log_loss")),
+    ]
+    for col, (name, val) in zip(cols, items):
+        col.metric(name, "-" if val is None else f"{val:.4f}")
+
+    plot_confusion_matrices(ev["confusion_matrix"], ev["class_names"])
+    plot_per_class_metrics(ev["classification_report"], ev["class_names"])
+
+    extra = []
+    if metrics.get("roc_auc") is not None:
+        extra.append(("ROC AUC", metrics["roc_auc"]))
+    if metrics.get("roc_auc_ovr_macro") is not None:
+        extra.append(("ROC AUC OVR Macro", metrics["roc_auc_ovr_macro"]))
+    if metrics.get("ap_macro") is not None:
+        extra.append(("AP Macro", metrics["ap_macro"]))
+
+    if extra:
+        cols = st.columns(len(extra))
+        for c, (n, v) in zip(cols, extra):
+            c.metric(n, f"{v:.4f}")
+
+    plot_roc_pr(ev)
+    st.write("### Misclassified Validation Samples")
+    show_misclassified(ev, max_items=12)
+
+
+def page_predict():
+    hero()
+    status_bar()
+    st.subheader("Predict")
+
+    if st.session_state.trained_model is None or not st.session_state.training_complete:
+        st.warning("No trained model is loaded yet. You can still upload one or many images now, but prediction will start only after training or loading a model.")
+
+    render_uploaded_images_section(
+        uploader_label="Upload one image or many images for prediction",
+        uploader_key="predict_page_image_uploader",
+        show_title=False,
+        show_gradcam=True,
+    )
+
+
+def page_visualize():
+    hero()
+    status_bar()
+    st.subheader("Visualize")
+
+    df = st.session_state.dataset_df
+    if df is None:
+        st.warning("Upload a dataset first.")
+        return
+
+    tab1, tab2, tab3, tab4 = st.tabs(["Data", "Training", "Validation", "Explainability"])
+
+    with tab1:
+        plot_class_distribution(df)
+        plot_image_dimensions(df)
+        show_sample_gallery(df, n_per_class=5)
+
+    with tab2:
+        plot_training_curves(st.session_state.history)
+
+    with tab3:
+        if st.session_state.eval_artifacts is None:
+            st.info("Train the model to unlock validation plots.")
+        else:
+            ev = st.session_state.eval_artifacts
+            plot_confusion_matrices(ev["confusion_matrix"], ev["class_names"])
+            plot_roc_pr(ev)
+            plot_per_class_metrics(ev["classification_report"], ev["class_names"])
+            plot_embedding_map(st.session_state.trained_model, ev, st.session_state.model_config)
+            show_misclassified(ev, max_items=12)
+
+    with tab4:
+        model = st.session_state.trained_model
+        if model is None:
+            st.info("Train or load a model first.")
+        else:
+            source = st.selectbox("Explainability Image Source", ["Validation sample", "Upload custom image"])
+            cfg = st.session_state.model_config
+            if source == "Validation sample":
+                ev = st.session_state.eval_artifacts
+                if ev is None:
+                    st.info("No validation results available.")
+                else:
+                    path = st.selectbox("Select validation image", ev["val_paths"][:min(200, len(ev["val_paths"]))])
+                    img = Image.open(path)
+                    arr = prepare_single_image(img, cfg)
+                    probs = model.predict(arr, verbose=0)[0]
+                    pred_idx = int(np.argmax(probs))
+                    st.write(f"**Predicted:** {st.session_state.class_names[pred_idx]} ({probs[pred_idx]:.4f})")
+                    c1, c2 = st.columns(2, gap="small")
+                    c1.image(img, caption="Original", use_container_width=True)
+                    heatmap = gradcam_heatmap(model, arr)
+                    overlay = overlay_heatmap_on_image(img.resize((cfg["image_size"], cfg["image_size"])), heatmap)
+                    if overlay is not None:
+                        c2.image(overlay, caption="Grad-CAM Overlay", use_container_width=True)
+            else:
+                up = st.file_uploader("Upload image", key="viz_custom_img", help="JPG/PNG/BMP/TIFF/WEBP/GIF work best. HEIC usually needs conversion.")
+                if up is not None:
+                    img, err = open_uploaded_image(up)
+                    if err:
+                        st.error(err)
+                        return
+                    arr = prepare_single_image(img, cfg)
+                    probs = model.predict(arr, verbose=0)[0]
+                    pred_idx = int(np.argmax(probs))
+                    st.write(f"**Predicted:** {st.session_state.class_names[pred_idx]} ({probs[pred_idx]:.4f})")
+                    c1, c2 = st.columns(2, gap="small")
+                    c1.image(img, caption="Original", use_container_width=True)
+                    heatmap = gradcam_heatmap(model, arr)
+                    overlay = overlay_heatmap_on_image(img.resize((cfg["image_size"], cfg["image_size"])), heatmap)
+                    if overlay is not None:
+                        c2.image(overlay, caption="Grad-CAM Overlay", use_container_width=True)
+
+
+def page_save_load():
+    hero()
+    status_bar()
+    st.subheader("Save / Load")
+
+    col1, col2 = st.columns(2, gap="small")
+
+    with col1:
+        st.write("### Save Current Project")
+        st.session_state.project_name = st.text_input("Save Name", value=st.session_state.project_name, key="save_name_input")
+        if st.button("Save Project", type="primary", use_container_width=True):
+            try:
+                project_dir = save_project(st.session_state.project_name)
+                st.success(f"Project saved to: {project_dir}")
+            except Exception as e:
+                st.error(f"Save failed: {e}")
+
+    with col2:
+        st.write("### Load Existing Project")
+        projects = available_projects()
+        if not projects:
+            st.info("No saved projects found yet.")
+        else:
+            choice = st.selectbox("Saved Projects", projects, format_func=lambda p: p.name)
+            if st.button("Load Selected Project", use_container_width=True):
+                try:
+                    load_project(choice)
+                    st.success(f"Loaded: {choice.name}")
+                except Exception as e:
+                    st.error(f"Load failed: {e}")
+
+    st.write("### Saved Project Inventory")
+    rows = []
+    for p in available_projects():
+        rows.append({
+            "project_dir": str(p),
+            "modified": datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+            "has_model": (p / "model.keras").exists(),
+            "has_metadata": (p / "metadata.joblib").exists(),
+        })
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+
+# -----------------------------
+# Workflow / project helpers
+# -----------------------------
+CNN_PAGES = [
+    "Home",
+    "Data Upload",
+    "Model",
+    "Preprocess",
+    "Train",
+    "Evaluate",
+    "Predict",
+    "Visualize",
+    "Save/Load",
+]
+
+
+def _cnn_go(page_name: str):
+    st.session_state.page = page_name
+
+
+def _cnn_reset_state(target_page: str):
+    preserved = {k: st.session_state[k] for k in list(st.session_state.keys()) if str(k).startswith("__unified_")}
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+    for k, v in preserved.items():
+        st.session_state[k] = v
+    init_state()
+    st.session_state.page = target_page
+    st.rerun()
+
+
+def _cnn_bottom_nav(page_name: str):
+    idx = CNN_PAGES.index(page_name) if page_name in CNN_PAGES else 0
+    st.write("")
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        if idx == 0:
+            st.button("⬅ Back to Home", use_container_width=True, disabled=True, key=f"cnn_back_{page_name}")
+        else:
+            prev_page = CNN_PAGES[idx - 1]
+            st.button(f"⬅ Back to {prev_page}", use_container_width=True, key=f"cnn_back_{page_name}", on_click=_cnn_go, args=(prev_page,))
+    with c2:
+        if idx >= len(CNN_PAGES) - 1:
+            st.button("Continue ➜", use_container_width=True, disabled=True, key=f"cnn_next_{page_name}")
+        else:
+            next_page = CNN_PAGES[idx + 1]
+            st.button(f"Continue to {next_page} ➜", use_container_width=True, key=f"cnn_next_{page_name}", on_click=_cnn_go, args=(next_page,))
+
+
+# -----------------------------
+# Main app
+# -----------------------------
+def main():
+    init_state()
+
+    pages = CNN_PAGES
+    if st.session_state.page not in pages:
+        st.session_state.page = "Home"
+
+    st.sidebar.title(APP_TITLE)
+    selected = st.sidebar.radio("Navigation", pages, index=pages.index(st.session_state.page) if st.session_state.page in pages else 0)
+    st.session_state.page = selected
+
+    st.sidebar.write("---")
+    if st.sidebar.button("➕ New Project", use_container_width=True):
+        _cnn_reset_state("Data Upload")
+    if st.sidebar.button("🗑️ Clear Current Project", use_container_width=True):
+        _cnn_reset_state("Home")
+
+    page_map = {
+        "Home": page_home,
+        "Data Upload": page_data_upload,
+        "Model": page_model,
+        "Preprocess": page_preprocess,
+        "Train": page_train,
+        "Evaluate": page_evaluate,
+        "Predict": page_predict,
+        "Visualize": page_visualize,
+        "Save/Load": page_save_load,
+    }
+
+    page_map[selected]()
+    _cnn_bottom_nav(selected)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+LSTM_SOURCE = r'''
+import io
+import json
+import math
+import os
+import tempfile
+import zipfile
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import joblib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import streamlit as st
+from scipy import stats
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import MinMaxScaler, RobustScaler, StandardScaler
+
+# -----------------------------
+# Lazy TensorFlow loader
+# -----------------------------
+_TF_CACHE: Dict[str, object] = {}
+
+
+def get_tf():
+    if "tf" not in _TF_CACHE:
+        import tensorflow as tf
+
+        _TF_CACHE["tf"] = tf
+    return _TF_CACHE["tf"]
+
+
+# -----------------------------
+# App constants
+# -----------------------------
+APP_TITLE = "Oil & Gas LSTM Studio"
+APP_SUBTITLE = "MATLAB-style workflow for multivariate energy forecasting with LSTM"
+PAGES = [
+    "Home",
+    "Data Upload",
+    "Model",
+    "Preprocess",
+    "Train",
+    "Evaluate",
+    "Predict",
+    "Visualize",
+    "Save/Load",
+]
+
+BASE_DIR = Path(".oil_gas_lstm_studio")
+PROJECTS_DIR = BASE_DIR / "projects"
+TEMP_IMPORT_DIR = BASE_DIR / "imports"
+for p in [BASE_DIR, PROJECTS_DIR, TEMP_IMPORT_DIR]:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+# -----------------------------
+# Styling
+# -----------------------------
+def inject_css() -> None:
     st.markdown(
         """
         <style>
-          .block-container { padding-top: 1rem; padding-bottom: 6rem; max-width: 1200px; }
-          @media (min-width: 1024px) { .block-container { padding-bottom: 2rem; } }
-
-          .hero {
-            border-radius: 18px;
-            padding: 28px;
+        .block-container {padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1350px;}
+        .hero {
+            padding: 1.2rem 1.4rem;
+            border-radius: 22px;
+            background: linear-gradient(135deg, #0f172a 0%, #111827 45%, #1e293b 100%);
             color: white;
-            background: linear-gradient(135deg, #0f172a 0%, #312e81 45%, #0891b2 100%);
-            position: relative;
-            overflow: hidden;
             border: 1px solid rgba(255,255,255,0.10);
-          }
-          .hero .blur1 {
-            position:absolute; top:-90px; right:-90px;
-            width:300px; height:300px; border-radius:999px;
-            background: rgba(34, 211, 238, 0.18);
-            filter: blur(40px);
-          }
-          .hero .blur2 {
-            position:absolute; bottom:-90px; left:-90px;
-            width:300px; height:300px; border-radius:999px;
-            background: rgba(99, 102, 241, 0.18);
-            filter: blur(40px);
-          }
-          .hero h1 { margin: 0.25rem 0 0.25rem 0; font-size: 2.0rem; }
-          @media (min-width: 768px){ .hero h1{ font-size: 2.8rem; } }
-
-          .ns-card {
-            border-radius: 16px;
-            padding: 18px;
-            border: 1px solid #e2e8f0;
-            background: white;
-            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
-          }
-          .muted { color: #64748b; }
-          .badge {
-            display:inline-block; padding: 4px 10px; border-radius:999px;
-            font-size: 12px; border: 1px solid #e2e8f0; background: #f8fafc; color:#0f172a;
-          }
-          .badge.good { background: #ecfdf5; border-color:#a7f3d0; color:#065f46; }
-          .badge.warn { background: #fffbeb; border-color:#fde68a; color:#92400e; }
-
-          .btn-row > div { width:100%; }
-          .btn-row button { width:100% !important; height: 48px !important; border-radius: 14px !important; }
-
-          .btn-grad > button {
-            background: linear-gradient(90deg, #06b6d4 0%, #6366f1 100%) !important;
-            color: white !important;
-            border: 0 !important;
-          }
-          .btn-emerald > button {
-            background: linear-gradient(90deg, #10b981 0%, #14b8a6 100%) !important;
-            color: white !important;
-            border: 0 !important;
-          }
-
-          .bottom-nav {
-            position: fixed;
-            left: 0; right: 0; bottom: 0;
-            background: rgba(255,255,255,0.92);
-            border-top: 1px solid #e2e8f0;
-            padding: 10px 12px;
-            z-index: 9999;
-          }
-          @media (min-width: 1024px){ .bottom-nav { display: none; } }
-          .bottom-nav .row {
-            max-width: 1200px; margin: 0 auto;
-            display: grid; grid-template-columns: repeat(9, 1fr);
-            gap: 6px;
-          }
-          .bottom-nav a {
-            text-decoration: none; color: #64748b;
-            font-size: 11px; text-align:center;
-            padding: 8px 6px; border-radius: 14px;
-            border: 1px solid transparent;
-            white-space: nowrap;
-          }
-          .bottom-nav a.active {
-            color: #4f46e5;
-            border-color: #c7d2fe;
-            background: #eef2ff;
-          }
+            box-shadow: 0 14px 34px rgba(15, 23, 42, 0.35);
+            margin-bottom: 1rem;
+        }
+        .hero h1 {margin: 0 0 0.35rem 0; font-size: 2rem;}
+        .hero p {margin: 0; color: rgba(255,255,255,0.84);}
+        .card {
+            background: linear-gradient(180deg, rgba(255,255,255,0.95), rgba(248,250,252,0.94));
+            border: 1px solid rgba(15,23,42,0.08);
+            border-radius: 18px;
+            padding: 1rem 1rem 0.9rem 1rem;
+            box-shadow: 0 10px 24px rgba(15,23,42,0.07);
+            margin-bottom: 1rem;
+        }
+        .pill {
+            display: inline-block;
+            padding: 0.28rem 0.65rem;
+            border-radius: 999px;
+            background: #e2e8f0;
+            color: #0f172a;
+            font-size: 0.82rem;
+            margin-right: 0.35rem;
+            margin-bottom: 0.35rem;
+        }
+        .section-title {
+            font-size: 1.1rem;
+            font-weight: 700;
+            margin-bottom: 0.65rem;
+        }
+        .small-muted {color: #475569; font-size: 0.9rem;}
+        .good {color: #0f766e; font-weight: 700;}
+        .bad {color: #b91c1c; font-weight: 700;}
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-def status_bar(current: str, processing: bool = False):
-    steps = ["data_loaded", "configured", "preprocessed", "trained", "evaluated"]
-    labels = {
-        "data_loaded": "Data Loaded",
-        "configured": "Model Selected",
-        "preprocessed": "Preprocessed",
-        "trained": "Trained",
-        "evaluated": "Evaluated",
+# -----------------------------
+# State helpers
+# -----------------------------
+def default_config() -> Dict:
+    return {
+        "date_col": None,
+        "feature_cols": [],
+        "target_cols": [],
+        "lookback": 30,
+        "horizon": 1,
+        "train_frac": 0.70,
+        "val_frac": 0.15,
+        "transform_mode": "raw",
+        "missing_method": "ffill_bfill",
+        "resample_rule": "None",
+        "scale_method": "standard",
+        "clip_outliers": False,
+        "clip_low_q": 0.01,
+        "clip_high_q": 0.99,
+        "lstm_units_1": 64,
+        "lstm_units_2": 64,
+        "lstm_units_3": 32,
+        "dense_units": 32,
+        "dropout": 0.20,
+        "learning_rate": 1e-3,
+        "epochs": 50,
+        "batch_size": 32,
+        "patience": 10,
+        "loss": "mse",
+        "seed": 42,
+        "project_name": "oil_gas_lstm_project",
     }
-    current_idx = steps.index(current) if current in steps else -1
-
-    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-    cols = st.columns(5)
-    for i, s in enumerate(steps):
-        done = i <= current_idx
-        with cols[i]:
-            st.markdown(
-                f"""
-                <div style="display:flex; gap:10px; align-items:center;">
-                  <div style="
-                    width:32px;height:32px;border-radius:999px;
-                    display:flex;align-items:center;justify-content:center;
-                    font-weight:700; font-size:14px;
-                    color:{'white' if done else '#64748b'};
-                    background:{'linear-gradient(90deg,#06b6d4,#6366f1)' if done else '#f1f5f9'};
-                    border:1px solid {'rgba(99,102,241,0.35)' if done else '#e2e8f0'};
-                  ">{i + 1}</div>
-                  <div style="font-size:13px; font-weight:600; color:{'#0f172a' if done else '#64748b'};">
-                    {labels[s]}
-                  </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-    if processing:
-        st.caption("Processing…")
-    st.markdown("</div>", unsafe_allow_html=True)
 
 
-def bottom_nav(active: str):
-    items = [
-        ("home", "Home"),
-        ("data", "Data"),
-        ("model", "Model"),
-        ("preprocess", "Preprocess"),
-        ("train", "Train"),
-        ("evaluate", "Evaluate"),
-        ("predict", "Predict"),
-        ("visualize", "Visualize"),
-        ("save", "Save"),
-    ]
+def init_state() -> None:
+    defaults = {
+        "page": "Home",
+        "raw_df": None,
+        "processed": None,
+        "training": None,
+        "prediction": None,
+        "config": default_config(),
+        "loaded_filename": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-    highlight = "model" if active == "cnn" else active
 
-    links = []
-    for key, label in items:
-        cls = "active" if key == highlight else ""
-        links.append(f'<a class="{cls}" href="?page={key}">{label}</a>')
+def reset_after_data_change() -> None:
+    st.session_state["processed"] = None
+    st.session_state["training"] = None
+    st.session_state["prediction"] = None
 
-    st.markdown(
-        f"""
-        <div class="bottom-nav">
-          <div class="row">
-            {''.join(links)}
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+
+# -----------------------------
+# Utility functions
+# -----------------------------
+def read_uploaded_data(uploaded_file) -> pd.DataFrame:
+    suffix = Path(uploaded_file.name).suffix.lower()
+    if suffix == ".csv":
+        return pd.read_csv(uploaded_file)
+    if suffix in {".xlsx", ".xls"}:
+        return pd.read_excel(uploaded_file)
+    raise ValueError("Unsupported file type. Use CSV, XLSX, or XLS.")
+
+
+def detect_date_column(df: pd.DataFrame) -> Optional[str]:
+    name_hits = [c for c in df.columns if any(x in str(c).lower() for x in ["date", "time", "timestamp"])]
+    for col in name_hits + list(df.columns):
+        try:
+            parsed = pd.to_datetime(df[col], errors="coerce")
+            if parsed.notna().mean() >= 0.70:
+                return col
+        except Exception:
+            continue
+    return None
+
+
+def get_numeric_columns(df: pd.DataFrame, exclude: Optional[List[str]] = None) -> List[str]:
+    exclude = exclude or []
+    numeric = []
+    for col in df.columns:
+        if col in exclude:
+            continue
+        series = pd.to_numeric(df[col], errors="coerce")
+        if series.notna().mean() >= 0.70:
+            numeric.append(col)
+    return numeric
+
+
+def coerce_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    out = df.copy()
+    for col in cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+
+def frequency_from_dates(dates: pd.Series) -> str:
+    if dates is None or len(dates) < 3:
+        return "Unknown"
+    diffs = dates.sort_values().diff().dropna().dt.total_seconds() / 86400.0
+    if len(diffs) == 0:
+        return "Unknown"
+    med = float(np.median(diffs))
+    if med <= 2:
+        return "Daily"
+    if med <= 10:
+        return "Weekly"
+    if med <= 40:
+        return "Monthly"
+    return "Irregular"
+
+
+def annualization_factor(freq_name: str) -> int:
+    if freq_name == "Daily":
+        return 252
+    if freq_name == "Weekly":
+        return 52
+    if freq_name == "Monthly":
+        return 12
+    return 252
+
+
+def make_scaler(name: str):
+    if name == "standard":
+        return StandardScaler()
+    if name == "minmax":
+        return MinMaxScaler()
+    if name == "robust":
+        return RobustScaler()
+    raise ValueError("Unknown scaler")
+
+
+def apply_missing(df: pd.DataFrame, method: str) -> pd.DataFrame:
+    out = df.copy()
+    if method == "drop":
+        return out.dropna()
+    if method == "ffill":
+        return out.ffill()
+    if method == "bfill":
+        return out.bfill()
+    if method == "ffill_bfill":
+        return out.ffill().bfill()
+    if method == "interpolate":
+        return out.interpolate(method="linear").ffill().bfill()
+    if method == "median_impute":
+        imp = SimpleImputer(strategy="median")
+        out[out.columns] = imp.fit_transform(out)
+        return out
+    return out
+
+
+def apply_transform(df: pd.DataFrame, mode: str) -> pd.DataFrame:
+    if mode == "raw":
+        return df.copy()
+    if mode == "pct_change":
+        return df.pct_change()
+    if mode == "log_return":
+        safe = df.replace(0, np.nan)
+        return np.log(safe / safe.shift(1))
+    raise ValueError("Unknown transform mode")
+
+
+def clip_quantiles(df: pd.DataFrame, low_q: float, high_q: float) -> pd.DataFrame:
+    low = df.quantile(low_q)
+    high = df.quantile(high_q)
+    return df.clip(low, high, axis=1)
+
+
+def create_sequences(
+    X: np.ndarray,
+    y: np.ndarray,
+    timestamps: np.ndarray,
+    lookback: int,
+    horizon: int,
+    train_end_idx: int,
+    val_end_idx: int,
+) -> Dict:
+    X_seq, y_seq = [], []
+    target_times = []
+    target_last_row_idx = []
+    split_tags = []
+
+    n_rows = len(X)
+    for end in range(lookback, n_rows - horizon + 1):
+        x_block = X[end - lookback : end, :]
+        y_block = y[end : end + horizon, :]
+        last_target_idx = end + horizon - 1
+        X_seq.append(x_block)
+        y_seq.append(y_block)
+        target_times.append(timestamps[end : end + horizon])
+        target_last_row_idx.append(last_target_idx)
+        if last_target_idx < train_end_idx:
+            split_tags.append("train")
+        elif last_target_idx < val_end_idx:
+            split_tags.append("val")
+        else:
+            split_tags.append("test")
+
+    return {
+        "X_seq": np.asarray(X_seq, dtype=np.float32),
+        "y_seq": np.asarray(y_seq, dtype=np.float32),
+        "target_times": np.asarray(target_times, dtype=object),
+        "target_last_row_idx": np.asarray(target_last_row_idx),
+        "split_tags": np.asarray(split_tags),
+    }
+
+
+def inverse_3d(flat_pred: np.ndarray, scaler, horizon: int, num_targets: int) -> np.ndarray:
+    arr = flat_pred.reshape(-1, horizon, num_targets)
+    inv = np.empty_like(arr, dtype=np.float64)
+    for step in range(horizon):
+        inv[:, step, :] = scaler.inverse_transform(arr[:, step, :])
+    return inv
+
+
+def flatten_y(y_3d: np.ndarray) -> np.ndarray:
+    return y_3d.reshape(y_3d.shape[0], -1)
+
+
+def model_summary_text(model) -> str:
+    lines: List[str] = []
+    model.summary(print_fn=lambda x: lines.append(x))
+    return "\n".join(lines)
+
+
+def preprocess_dataset(df: pd.DataFrame, cfg: Dict) -> Dict:
+    if df is None or df.empty:
+        raise ValueError("No dataset loaded.")
+    date_col = cfg["date_col"]
+    feature_cols = cfg["feature_cols"]
+    target_cols = cfg["target_cols"]
+    lookback = int(cfg["lookback"])
+    horizon = int(cfg["horizon"])
+
+    if not feature_cols:
+        raise ValueError("Select at least one feature column.")
+    if not target_cols:
+        raise ValueError("Select at least one target column.")
+    if lookback < 2:
+        raise ValueError("Lookback must be at least 2.")
+    if horizon < 1:
+        raise ValueError("Horizon must be at least 1.")
+
+    work = df.copy()
+    if date_col:
+        work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+        work = work.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True)
+        dates = work[date_col].copy()
+    else:
+        dates = pd.Series(pd.date_range("2000-01-01", periods=len(work), freq="D"))
+
+    keep_cols = list(dict.fromkeys(feature_cols + target_cols))
+    numeric_df = coerce_numeric(work[keep_cols], keep_cols)
+
+    if cfg["resample_rule"] != "None" and date_col:
+        tmp = pd.concat([dates, numeric_df], axis=1).set_index(date_col)
+        numeric_df = tmp.resample(cfg["resample_rule"]).mean()
+        dates = pd.Series(numeric_df.index)
+        numeric_df = numeric_df.reset_index(drop=True)
+
+    numeric_df = apply_missing(numeric_df, cfg["missing_method"])
+    if cfg["clip_outliers"]:
+        numeric_df = clip_quantiles(numeric_df, cfg["clip_low_q"], cfg["clip_high_q"])
+
+    transformed = apply_transform(numeric_df, cfg["transform_mode"])
+    transformed = apply_missing(transformed, cfg["missing_method"])
+    valid_mask = transformed.notna().all(axis=1)
+    transformed = transformed.loc[valid_mask].reset_index(drop=True)
+    numeric_df = numeric_df.loc[valid_mask].reset_index(drop=True)
+    dates = dates.loc[valid_mask].reset_index(drop=True)
+
+    feature_frame = transformed[feature_cols].copy()
+    target_frame = transformed[target_cols].copy()
+
+    n = len(transformed)
+    if n <= lookback + horizon + 10:
+        raise ValueError("Dataset is too small after preprocessing for the chosen lookback and horizon.")
+
+    train_end_idx = int(n * cfg["train_frac"])
+    val_end_idx = int(n * (cfg["train_frac"] + cfg["val_frac"]))
+    train_end_idx = max(train_end_idx, lookback + horizon)
+    val_end_idx = max(val_end_idx, train_end_idx + 1)
+    val_end_idx = min(val_end_idx, n - 1)
+
+    feature_scaler = make_scaler(cfg["scale_method"])
+    target_scaler = make_scaler(cfg["scale_method"])
+    feature_scaler.fit(feature_frame.iloc[:train_end_idx])
+    target_scaler.fit(target_frame.iloc[:train_end_idx])
+
+    X_scaled = feature_scaler.transform(feature_frame)
+    y_scaled = target_scaler.transform(target_frame)
+
+    seq = create_sequences(
+        X_scaled,
+        y_scaled,
+        dates.to_numpy(),
+        lookback,
+        horizon,
+        train_end_idx=train_end_idx,
+        val_end_idx=val_end_idx,
     )
 
+    X_seq = seq["X_seq"]
+    y_seq = seq["y_seq"]
+    tags = seq["split_tags"]
 
-def new_project() -> Dict[str, Any]:
-    p = {
-        "id": str(uuid.uuid4()),
-        "name": f"Project {time.strftime('%Y-%m-%d')}",
-        "task_type": "auto-detect",  # applies to ANN, and also can apply to LSTM now
-        "model_type": "ann",
-        "status": "data_loaded",
-        "dataset": {"filename": "—", "rows": 0, "cols": 0, "missing": 0, "path": None, "file_type": None, "sheet": None},
-        "columns": {"target": None, "time": None, "features": []},
-        "preprocess": {
-            "missing_strategy": "Drop rows",
-            "split": 0.8,
-            "seed": 42,
-            "lookback": 20,
-            "horizon": 1,
-        },
-        "train_config": {"epochs": 20, "batch_size": 32, "lr": 0.001, "early_stop": False, "patience": 5},
-        "history": {"loss": [], "val_loss": []},
-        "evaluation_metrics": None,
-        "artifacts": None,
-        "feature_meta": {},
-        "target_profile": {},
-        "viz_cache": {},
-        "ann_config": {"hidden_layers": 3, "neurons": [256, 128, 64], "activation": "ReLU", "output_activation": "Auto"},
-        "lstm_config": {"units": 64, "layers": 2, "dropout": 0.2, "bidirectional": False},
-        "ann_threshold": 0.5,  # for binary classification
-    }
-    upsert_project(p)
-    return p
+    X_train = X_seq[tags == "train"]
+    X_val = X_seq[tags == "val"]
+    X_test = X_seq[tags == "test"]
+    y_train = y_seq[tags == "train"]
+    y_val = y_seq[tags == "val"]
+    y_test = y_seq[tags == "test"]
 
+    if len(X_train) == 0 or len(X_val) == 0 or len(X_test) == 0:
+        raise ValueError("Split produced an empty train/validation/test segment. Adjust split fractions or reduce lookback.")
 
-def ensure_current_project() -> Optional[Dict[str, Any]]:
-    return get_current_project()
-
-
-def project_badge(p: Dict[str, Any]) -> str:
-    model = p.get("model_type", "—").upper()
-    task = (p.get("evaluation_metrics") or {}).get("task") or p.get("task_type", "—")
-    return f"{model} • {task}"
-
-
-# ============================================================
-# Caching
-# ============================================================
-@st.cache_data(show_spinner=False)
-def cached_load_dataset(path: str, file_type: str, sheet: Optional[str]):
-    if file_type == "csv":
-        return pd.read_csv(path)
-    return pd.read_excel(path, sheet_name=sheet)
-
-
-@st.cache_resource(show_spinner=False)
-def cached_load_ann_artifacts(model_path: str, preprocessor_path: str, label_encoder_path: str):
-    tf = _get_tf()
-    model = tf.keras.models.load_model(model_path)
-    preprocessor = joblib.load(preprocessor_path)
-    label_encoder = joblib.load(label_encoder_path)
-    return model, preprocessor, label_encoder
-
-
-@st.cache_resource(show_spinner=False)
-def cached_load_lstm_artifacts(model_path: str, pack_path: str, outputs_path: str):
-    tf = _get_tf()
-    model = tf.keras.models.load_model(model_path)
-    pack = joblib.load(pack_path)
-    outputs = np.load(outputs_path, allow_pickle=False)
-    return model, pack, outputs
-
-
-@st.cache_data(show_spinner=False)
-def cached_feature_meta(dataset_path: str, file_type: str, sheet: Optional[str], features: Tuple[str, ...]) -> Dict[str, Any]:
-    if file_type == "csv":
-        df_full = pd.read_csv(dataset_path)
-    else:
-        df_full = pd.read_excel(dataset_path, sheet_name=sheet)
-    return build_feature_meta(df_full, list(features))
-
-
-# ============================================================
-# Data loading helpers
-# ============================================================
-def load_project_dataset(p: Dict[str, Any]) -> pd.DataFrame:
-    ds = p.get("dataset", {})
-    path = ds.get("path")
-    if not path:
-        raise FileNotFoundError("Dataset file not saved. Upload again in Data page.")
-    return cached_load_dataset(path, ds.get("file_type"), ds.get("sheet"))
-
-
-def build_feature_meta(df: pd.DataFrame, features: List[str]) -> Dict[str, Any]:
-    meta: Dict[str, Any] = {}
-    for f in features:
-        if f not in df.columns:
-            continue
-        s = df[f]
-        is_num = pd.api.types.is_numeric_dtype(s)
-        meta[f] = {"type": "numeric" if is_num else "categorical"}
-        if not is_num:
-            vals = s.dropna().astype(str).unique().tolist()
-            meta[f]["options"] = vals[:50]
-    return meta
-
-
-def build_target_profile(df: pd.DataFrame, target_col: str) -> Dict[str, Any]:
-    if target_col not in df.columns:
-        return {}
-    y = df[target_col].copy()
-    y_num = pd.to_numeric(y, errors="coerce")
-    if y_num.notna().sum() >= max(5, int(0.2 * len(y))):
-        yv = y_num.dropna().astype(float)
-        return {
-            "type": "regression",
-            "count": int(len(yv)),
-            "min": float(np.nanmin(yv.values)) if len(yv) else None,
-            "max": float(np.nanmax(yv.values)) if len(yv) else None,
-            "mean": float(np.nanmean(yv.values)) if len(yv) else None,
-            "std": float(np.nanstd(yv.values)) if len(yv) else None,
-        }
-    ys = y.astype(str).fillna("NA")
-    vc = ys.value_counts().head(20)
     return {
-        "type": "classification",
-        "count": int(len(ys)),
-        "classes_top": vc.index.tolist(),
-        "counts_top": vc.values.astype(int).tolist(),
+        "dates": dates,
+        "original_numeric": numeric_df,
+        "transformed": transformed,
+        "feature_cols": feature_cols,
+        "target_cols": target_cols,
+        "feature_scaler": feature_scaler,
+        "target_scaler": target_scaler,
+        "X_seq": X_seq,
+        "y_seq": y_seq,
+        "target_times": seq["target_times"],
+        "split_tags": tags,
+        "X_train": X_train,
+        "y_train": y_train,
+        "X_val": X_val,
+        "y_val": y_val,
+        "X_test": X_test,
+        "y_test": y_test,
+        "y_train_flat": flatten_y(y_train),
+        "y_val_flat": flatten_y(y_val),
+        "y_test_flat": flatten_y(y_test),
+        "train_end_idx": train_end_idx,
+        "val_end_idx": val_end_idx,
+        "freq_name": frequency_from_dates(pd.to_datetime(dates, errors="coerce")),
+        "config_snapshot": dict(cfg),
     }
 
 
-# ============================================================
-# Plot helpers (professional, no seaborn)
-# ============================================================
-def _apply_plot_style(plt):
-    try:
-        plt.rcParams.update(
+def build_model(input_shape: Tuple[int, int], num_targets: int, horizon: int, cfg: Dict):
+    tf = get_tf()
+    tf.keras.backend.clear_session()
+    if hasattr(tf.keras.utils, "set_random_seed"):
+        tf.keras.utils.set_random_seed(int(cfg["seed"]))
+    inp = tf.keras.Input(shape=input_shape)
+    x = tf.keras.layers.LSTM(int(cfg["lstm_units_1"]), return_sequences=True)(inp)
+    x = tf.keras.layers.LayerNormalization()(x)
+    x = tf.keras.layers.Dropout(float(cfg["dropout"]))(x)
+
+    x = tf.keras.layers.LSTM(int(cfg["lstm_units_2"]), return_sequences=True)(x)
+    x = tf.keras.layers.LayerNormalization()(x)
+    x = tf.keras.layers.Dropout(float(cfg["dropout"]))(x)
+
+    x = tf.keras.layers.LSTM(int(cfg["lstm_units_3"]), return_sequences=False)(x)
+    x = tf.keras.layers.LayerNormalization()(x)
+    x = tf.keras.layers.Dropout(float(cfg["dropout"]))(x)
+
+    x = tf.keras.layers.Dense(int(cfg["dense_units"]), activation="relu")(x)
+    x = tf.keras.layers.Dropout(float(cfg["dropout"]))(x)
+    out = tf.keras.layers.Dense(horizon * num_targets, name="forecast")(x)
+    model = tf.keras.Model(inp, out)
+
+    loss_name = cfg["loss"]
+    if loss_name == "huber":
+        loss_fn = tf.keras.losses.Huber()
+    else:
+        loss_fn = loss_name
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=float(cfg["learning_rate"])),
+        loss=loss_fn,
+        metrics=[tf.keras.metrics.MeanAbsoluteError(name="mae"), tf.keras.metrics.RootMeanSquaredError(name="rmse")],
+    )
+    return model
+
+
+class StreamlitTrainProgressCallback:
+    def __init__(self, progress_bar, info_box, total_epochs: int):
+        self.progress_bar = progress_bar
+        self.info_box = info_box
+        self.total_epochs = max(1, int(total_epochs))
+
+    def as_callback(self):
+        tf = get_tf()
+        outer = self
+
+        class _CB(tf.keras.callbacks.Callback):
+            def on_epoch_end(self, epoch, logs=None):
+                logs = logs or {}
+                frac = (epoch + 1) / outer.total_epochs
+                outer.progress_bar.progress(min(frac, 1.0))
+                parts = [f"Epoch {epoch + 1}/{outer.total_epochs}"]
+                for key in ["loss", "mae", "rmse", "val_loss", "val_mae", "val_rmse"]:
+                    if key in logs:
+                        try:
+                            parts.append(f"{key}: {float(logs[key]):.4f}")
+                        except Exception:
+                            pass
+                outer.info_box.markdown(" | ".join(parts))
+
+        return _CB()
+
+
+def train_model(processed: Dict, cfg: Dict) -> Dict:
+    tf = get_tf()
+    num_targets = len(processed["target_cols"])
+    horizon = int(cfg["horizon"])
+    model = build_model(processed["X_train"].shape[1:], num_targets, horizon, cfg)
+
+    ckpt_dir = tempfile.mkdtemp(prefix="oilgas_lstm_ckpt_")
+    ckpt_path = str(Path(ckpt_dir) / "best_model.keras")
+
+    progress_bar = st.progress(0)
+    info_box = st.empty()
+
+    callbacks = [
+        StreamlitTrainProgressCallback(progress_bar, info_box, int(cfg["epochs"])).as_callback(),
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_loss",
+            patience=int(cfg["patience"]),
+            restore_best_weights=True,
+            verbose=1,
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.5,
+            patience=max(2, int(cfg["patience"]) // 2),
+            min_lr=1e-6,
+            verbose=1,
+        ),
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=ckpt_path,
+            monitor="val_loss",
+            save_best_only=True,
+            verbose=1,
+        ),
+    ]
+
+    history = model.fit(
+        processed["X_train"],
+        processed["y_train_flat"],
+        validation_data=(processed["X_val"], processed["y_val_flat"]),
+        epochs=int(cfg["epochs"]),
+        batch_size=int(cfg["batch_size"]),
+        verbose=0,
+        callbacks=callbacks,
+        shuffle=True,
+    )
+
+    progress_bar.progress(1.0)
+    info_box.success("Training finished.")
+
+    val_pred_flat = model.predict(processed["X_val"], verbose=0)
+    test_pred_flat = model.predict(processed["X_test"], verbose=0)
+    train_pred_flat = model.predict(processed["X_train"], verbose=0)
+
+    preds = {
+        "train": inverse_3d(train_pred_flat, processed["target_scaler"], horizon, num_targets),
+        "val": inverse_3d(val_pred_flat, processed["target_scaler"], horizon, num_targets),
+        "test": inverse_3d(test_pred_flat, processed["target_scaler"], horizon, num_targets),
+    }
+    actuals = {
+        "train": inverse_3d(processed["y_train_flat"], processed["target_scaler"], horizon, num_targets),
+        "val": inverse_3d(processed["y_val_flat"], processed["target_scaler"], horizon, num_targets),
+        "test": inverse_3d(processed["y_test_flat"], processed["target_scaler"], horizon, num_targets),
+    }
+
+    split_tags = processed["split_tags"]
+    split_times = {
+        "train": processed["target_times"][split_tags == "train"],
+        "val": processed["target_times"][split_tags == "val"],
+        "test": processed["target_times"][split_tags == "test"],
+    }
+
+    metrics_tables = {
+        split: compute_metrics_table(actuals[split], preds[split], processed["target_cols"], horizon)
+        for split in ["train", "val", "test"]
+    }
+
+    return {
+        "model": model,
+        "history": history.history,
+        "predictions": preds,
+        "actuals": actuals,
+        "times": split_times,
+        "metrics": metrics_tables,
+        "model_summary": model_summary_text(model),
+    }
+
+
+def safe_mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    denom = np.where(np.abs(y_true) < 1e-8, np.nan, np.abs(y_true))
+    out = np.abs((y_true - y_pred) / denom)
+    return float(np.nanmean(out) * 100.0)
+
+
+def directional_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float((np.sign(y_true) == np.sign(y_pred)).mean() * 100.0)
+
+
+def compute_metrics_table(actual_3d: np.ndarray, pred_3d: np.ndarray, target_cols: List[str], horizon: int) -> pd.DataFrame:
+    rows = []
+    for h in range(horizon):
+        for i, col in enumerate(target_cols):
+            yt = actual_3d[:, h, i]
+            yp = pred_3d[:, h, i]
+            rows.append(
+                {
+                    "horizon_step": h + 1,
+                    "target": col,
+                    "MAE": mean_absolute_error(yt, yp),
+                    "RMSE": math.sqrt(mean_squared_error(yt, yp)),
+                    "MAPE_%": safe_mape(yt, yp),
+                    "R2": r2_score(yt, yp),
+                    "Directional_Accuracy_%": directional_accuracy(yt, yp),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def backtest_strategies(actual_returns: np.ndarray, predicted_returns: np.ndarray, dates: np.ndarray, target_cols: List[str], freq_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    actual = np.asarray(actual_returns, dtype=float)
+    pred = np.asarray(predicted_returns, dtype=float)
+    if actual.ndim != 2 or pred.ndim != 2:
+        raise ValueError("Backtest inputs must be 2D arrays [samples, targets].")
+
+    n_samples, n_assets = actual.shape
+    eq = np.full(n_assets, 1.0 / n_assets)
+
+    strat_returns = {
+        "EqualWeight": np.full(n_samples, np.nan),
+        "BestBet": np.full(n_samples, np.nan),
+        "LongOnly": np.full(n_samples, np.nan),
+        "LongShort": np.full(n_samples, np.nan),
+    }
+
+    for t in range(n_samples):
+        p = pred[t]
+        a = actual[t]
+        strat_returns["EqualWeight"][t] = float(np.dot(eq, a))
+
+        best_idx = int(np.argmax(p))
+        w_best = np.zeros(n_assets)
+        w_best[best_idx] = 1.0
+        strat_returns["BestBet"][t] = float(np.dot(w_best, a))
+
+        positive = np.where(p > 0, p, 0)
+        if positive.sum() > 0:
+            w_long = positive / positive.sum()
+        else:
+            w_long = np.zeros(n_assets)
+        strat_returns["LongOnly"][t] = float(np.dot(w_long, a))
+
+        abs_sum = np.abs(p).sum()
+        if abs_sum > 0:
+            w_ls = p / abs_sum
+        else:
+            w_ls = np.zeros(n_assets)
+        strat_returns["LongShort"][t] = float(np.dot(w_ls, a))
+
+    returns_df = pd.DataFrame(strat_returns, index=pd.to_datetime(dates))
+    equity_df = (1.0 + returns_df.fillna(0)).cumprod()
+
+    ann = annualization_factor(freq_name)
+    summary_rows = []
+    for col in returns_df.columns:
+        r = returns_df[col].dropna()
+        if len(r) == 0:
+            continue
+        equity = (1.0 + r).cumprod()
+        total_return = float(equity.iloc[-1] - 1.0)
+        years = max(len(r) / ann, 1e-8)
+        cagr = float(equity.iloc[-1] ** (1 / years) - 1.0)
+        vol = float(r.std(ddof=1) * np.sqrt(ann)) if len(r) > 1 else np.nan
+        sharpe = float((r.mean() / r.std(ddof=1)) * np.sqrt(ann)) if len(r) > 1 and r.std(ddof=1) > 0 else np.nan
+        drawdown = equity / equity.cummax() - 1.0
+        max_dd = float(drawdown.min())
+        hit = float((r > 0).mean() * 100.0)
+        summary_rows.append(
             {
-                "figure.dpi": 130,
-                "savefig.dpi": 200,
-                "font.size": 11,
-                "axes.titlesize": 14,
-                "axes.labelsize": 12,
-                "axes.titleweight": "bold",
-                "axes.grid": True,
-                "grid.alpha": 0.22,
-                "grid.linestyle": "-",
-                "axes.spines.top": False,
-                "axes.spines.right": False,
-                "legend.frameon": False,
+                "strategy": col,
+                "Total_Return_%": total_return * 100.0,
+                "CAGR_%": cagr * 100.0,
+                "Volatility_%": vol * 100.0 if pd.notna(vol) else np.nan,
+                "Sharpe": sharpe,
+                "Max_Drawdown_%": max_dd * 100.0,
+                "Positive_Periods_%": hit,
             }
         )
-    except Exception:
-        pass
+
+    return equity_df, pd.DataFrame(summary_rows)
 
 
-def _plot_confusion_matrix(
-    plt,
-    cm: np.ndarray,
-    class_names: Optional[List[str]] = None,
-    title: str = "Confusion Matrix",
-):
-    cm = np.array(cm, dtype=float)
+def returns_for_backtest(transform_mode: str, values: np.ndarray) -> np.ndarray:
+    if transform_mode == "pct_change":
+        return values
+    if transform_mode == "log_return":
+        return np.expm1(values)
+    raise ValueError("Backtest is only valid for pct_change or log_return mode.")
 
-    fig = plt.figure(figsize=(6.0, 4.0))
-    ax = fig.gca()
 
-    # Heatmap with smoother visual
-    im = ax.imshow(cm, aspect="auto")
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.ax.set_ylabel("Count", rotation=90)
+def make_bundle_bytes() -> bytes:
+    processed = st.session_state.get("processed")
+    training = st.session_state.get("training")
+    cfg = st.session_state.get("config")
+    if processed is None or training is None:
+        raise ValueError("Nothing to save. Preprocess and train first.")
 
-    ax.set_title(title, fontsize=13, pad=12)
-    ax.set_xlabel("Predicted Label")
-    ax.set_ylabel("Actual Label")
+    with tempfile.TemporaryDirectory(prefix="oilgas_bundle_") as tmpdir:
+        tmp = Path(tmpdir)
+        model_path = tmp / "model.keras"
+        state_path = tmp / "state.joblib"
+        cfg_path = tmp / "config.json"
+        metrics_path = tmp / "test_metrics.csv"
 
-    n = cm.shape[0]
-    ax.set_xticks(range(n))
-    ax.set_yticks(range(n))
+        training["model"].save(model_path)
+        payload = {
+            "processed": {k: v for k, v in processed.items() if k not in {"feature_scaler", "target_scaler"}},
+            "feature_scaler": processed["feature_scaler"],
+            "target_scaler": processed["target_scaler"],
+            "training": {k: v for k, v in training.items() if k != "model"},
+            "raw_df": st.session_state.get("raw_df"),
+            "loaded_filename": st.session_state.get("loaded_filename"),
+        }
+        joblib.dump(payload, state_path)
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, default=str)
+        training["metrics"]["test"].to_csv(metrics_path, index=False)
 
-    if class_names and len(class_names) == n:
-        ax.set_xticklabels(class_names, rotation=25, ha="right")
-        ax.set_yticklabels(class_names)
+        mem = io.BytesIO()
+        with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.write(model_path, arcname="model.keras")
+            zf.write(state_path, arcname="state.joblib")
+            zf.write(cfg_path, arcname="config.json")
+            zf.write(metrics_path, arcname="test_metrics.csv")
+        return mem.getvalue()
 
-    # Add value annotations with contrast-aware color
-    max_val = cm.max() if cm.size else 0
-    threshold = max_val / 2.0 if max_val > 0 else 0
 
-    for i in range(n):
-        for j in range(n):
-            value = int(cm[i, j])
-            color = "white" if value > threshold else "black"
-            ax.text(j, i, f"{value}", ha="center", va="center", color=color, fontsize=11)
+def load_bundle(uploaded_zip) -> None:
+    data = uploaded_zip.getvalue()
+    import_dir = Path(tempfile.mkdtemp(prefix="oilgas_import_", dir=str(TEMP_IMPORT_DIR)))
+    with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+        zf.extractall(import_dir)
 
-    ax.set_ylim(n - 0.5, -0.5)  # fix matplotlib cut-off issue
+    tf = get_tf()
+    model = tf.keras.models.load_model(import_dir / "model.keras")
+    payload = joblib.load(import_dir / "state.joblib")
+    with open(import_dir / "config.json", "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    processed = payload["processed"]
+    processed["feature_scaler"] = payload["feature_scaler"]
+    processed["target_scaler"] = payload["target_scaler"]
+    training = payload["training"]
+    training["model"] = model
+
+    st.session_state["config"] = cfg
+    st.session_state["processed"] = processed
+    st.session_state["training"] = training
+    st.session_state["raw_df"] = payload["raw_df"]
+    st.session_state["loaded_filename"] = payload["loaded_filename"]
+    st.session_state["prediction"] = None
+
+
+# -----------------------------
+# Plot helpers
+# -----------------------------
+PLOT_W = 5.6
+PLOT_H = 2.7
+
+def fig_line(df: pd.DataFrame, title: str, ylabel: str = "Value"):
+    fig, ax = plt.subplots(figsize=(PLOT_W, PLOT_H))
+    for col in df.columns:
+        ax.plot(df.index, df[col], label=str(col), linewidth=1.5)
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    ax.grid(alpha=0.25)
+    ax.legend(loc="upper right", ncols=min(4, len(df.columns)), fontsize=8)
     fig.tight_layout()
-
     return fig
 
 
-def _plot_roc_pr_threshold(plt, y_true: np.ndarray, y_score: np.ndarray):
-    # local import (small)
-    from sklearn.metrics import precision_recall_curve, roc_curve, auc
-
-    y_true = np.asarray(y_true).astype(int)
-    y_score = np.asarray(y_score).astype(float)
-
-    # ROC
-    fpr, tpr, _ = roc_curve(y_true, y_score)
-    roc_auc = float(auc(fpr, tpr))
-    fig_roc = plt.figure(figsize=(5.2, 4.0))
-    ax = fig_roc.gca()
-    ax.plot(fpr, tpr, linewidth=2.2)
-    ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1.3)
-    ax.set_title(f"ROC Curve (AUC = {roc_auc:.3f})")
-    ax.set_xlabel("False Positive Rate")
-    ax.set_ylabel("True Positive Rate")
-    ax.grid(True, alpha=0.22)
-    fig_roc.tight_layout()
-
-    # PR
-    p, r, _ = precision_recall_curve(y_true, y_score)
-    fig_pr = plt.figure(figsize=(5.2, 4.0))
-    ax2 = fig_pr.gca()
-    ax2.plot(r, p, linewidth=2.2)
-    ax2.set_title("Precision–Recall Curve")
-    ax2.set_xlabel("Recall")
-    ax2.set_ylabel("Precision")
-    ax2.grid(True, alpha=0.22)
-    fig_pr.tight_layout()
-
-    # Threshold curves
-    pr_p, pr_r, pr_thr = precision_recall_curve(y_true, y_score)
-    pr_thr = np.clip(pr_thr, 0.0, 1.0)
-    # Align lengths: thr has len-1 relative to p/r
-    p2 = pr_p[:-1]
-    r2 = pr_r[:-1]
-    f1 = (2 * p2 * r2) / np.clip((p2 + r2), 1e-9, None)
-
-    fig_thr = plt.figure(figsize=(10.5, 3.8))
-    ax3 = fig_thr.gca()
-    ax3.plot(pr_thr, p2, label="Precision", linewidth=2.0)
-    ax3.plot(pr_thr, r2, label="Recall", linewidth=2.0)
-    ax3.plot(pr_thr, f1, label="F1", linewidth=2.0)
-    ax3.set_title("Threshold vs Precision / Recall / F1")
-    ax3.set_xlabel("Threshold")
-    ax3.set_ylabel("Score")
-    ax3.grid(True, alpha=0.22)
-    ax3.legend(loc="best")
-    fig_thr.tight_layout()
-
-    return fig_roc, fig_pr, fig_thr
+def fig_training_history(history: Dict):
+    fig, ax = plt.subplots(figsize=(PLOT_W, PLOT_H))
+    if "loss" in history:
+        ax.plot(history["loss"], label="Train Loss", linewidth=2)
+    if "val_loss" in history:
+        ax.plot(history["val_loss"], label="Validation Loss", linewidth=2)
+        best_epoch = int(np.argmin(history["val_loss"]))
+        ax.axvline(best_epoch, linestyle="--", linewidth=1)
+    ax.set_title("Training History")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.grid(alpha=0.25)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    return fig
 
 
-# ============================================================
-# Pages
-# ============================================================
-def page_home():
+def fig_actual_vs_predicted(actual: np.ndarray, pred: np.ndarray, title: str):
+    fig, ax = plt.subplots(figsize=(PLOT_W, PLOT_H))
+    ax.plot(actual, label="Actual", linewidth=1.8)
+    ax.plot(pred, label="Predicted", linewidth=1.5)
+    ax.axhline(0, linewidth=1)
+    ax.set_title(title)
+    ax.set_xlabel("Sample")
+    ax.set_ylabel("Value")
+    ax.grid(alpha=0.25)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    return fig
+
+
+def fig_distribution(actual: np.ndarray, pred: np.ndarray, title: str):
+    fig, ax = plt.subplots(figsize=(PLOT_W, PLOT_H))
+    bins = 40
+    ax.hist(actual, bins=bins, alpha=0.6, label="Actual")
+    ax.hist(pred, bins=bins, alpha=0.6, label="Predicted")
+    ax.set_title(title)
+    ax.grid(alpha=0.25)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    return fig
+
+
+def fig_scatter(actual: np.ndarray, pred: np.ndarray, title: str):
+    fig, ax = plt.subplots(figsize=(PLOT_W, PLOT_H))
+    ax.scatter(actual, pred, alpha=0.55)
+    low = min(np.min(actual), np.min(pred))
+    high = max(np.max(actual), np.max(pred))
+    ax.plot([low, high], [low, high], linestyle="--", linewidth=1.2)
+    ax.set_title(title)
+    ax.set_xlabel("Actual")
+    ax.set_ylabel("Predicted")
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    return fig
+
+
+def fig_residuals_vs_pred(pred: np.ndarray, residuals: np.ndarray, title: str):
+    fig, ax = plt.subplots(figsize=(PLOT_W, PLOT_H))
+    ax.scatter(pred, residuals, alpha=0.55)
+    ax.axhline(0, linewidth=1.2)
+    std = np.std(residuals)
+    ax.axhline(2 * std, linestyle="--", linewidth=1)
+    ax.axhline(-2 * std, linestyle="--", linewidth=1)
+    ax.set_title(title)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Residual")
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    return fig
+
+
+def fig_residual_hist(residuals: np.ndarray, title: str):
+    fig, ax = plt.subplots(figsize=(PLOT_W, PLOT_H))
+    ax.hist(residuals, bins=40, alpha=0.75)
+    ax.axvline(np.mean(residuals), linestyle="--", linewidth=1.2)
+    ax.set_title(title)
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    return fig
+
+
+def fig_qq(residuals: np.ndarray, title: str):
+    fig = plt.figure(figsize=(PLOT_W, PLOT_H))
+    ax = fig.add_subplot(111)
+    stats.probplot(residuals, dist="norm", plot=ax)
+    ax.set_title(title)
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    return fig
+
+
+def fig_rolling_rmse(actual: np.ndarray, pred: np.ndarray, title: str, window: int = 30):
+    errors = (actual - pred) ** 2
+    rolling = pd.Series(errors).rolling(window=window, min_periods=max(5, window // 3)).mean().pow(0.5)
+    fig, ax = plt.subplots(figsize=(PLOT_W, PLOT_H))
+    ax.plot(rolling.values, linewidth=1.7)
+    ax.set_title(title)
+    ax.set_xlabel("Sample")
+    ax.set_ylabel("Rolling RMSE")
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    return fig
+
+
+def fig_correlation_heatmap(df: pd.DataFrame, title: str):
+    corr = df.corr(numeric_only=True)
+    fig, ax = plt.subplots(figsize=(PLOT_W, PLOT_H))
+    im = ax.imshow(corr.values, aspect="auto")
+    ax.set_title(title)
+    ax.set_xticks(range(len(corr.columns)))
+    ax.set_xticklabels(corr.columns, rotation=45, ha="right")
+    ax.set_yticks(range(len(corr.columns)))
+    ax.set_yticklabels(corr.columns)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    return fig
+
+
+def fig_missing_bars(df: pd.DataFrame, title: str):
+    miss = df.isna().sum().sort_values(ascending=False)
+    fig, ax = plt.subplots(figsize=(PLOT_W, PLOT_H))
+    ax.bar(miss.index.astype(str), miss.values)
+    ax.set_title(title)
+    ax.set_ylabel("Missing Count")
+    ax.tick_params(axis="x", rotation=45)
+    ax.grid(alpha=0.25, axis="y")
+    return fig
+
+
+def fig_split_overview(dates: pd.Series, train_end_idx: int, val_end_idx: int, title: str):
+    fig, ax = plt.subplots(figsize=(PLOT_W, PLOT_H))
+    ax.plot(dates, np.ones(len(dates)), alpha=0)
+    ax.axvspan(dates.iloc[0], dates.iloc[train_end_idx - 1], alpha=0.25)
+    ax.axvspan(dates.iloc[train_end_idx], dates.iloc[val_end_idx - 1], alpha=0.25)
+    ax.axvspan(dates.iloc[val_end_idx], dates.iloc[-1], alpha=0.25)
+    ax.set_yticks([])
+    ax.set_title(title)
+    return fig
+
+
+def fig_equity_curves(equity_df: pd.DataFrame, title: str):
+    fig, ax = plt.subplots(figsize=(PLOT_W, PLOT_H))
+    for col in equity_df.columns:
+        ax.plot(equity_df.index, equity_df[col], label=col, linewidth=1.8)
+    ax.set_title(title)
+    ax.set_ylabel("Equity (Start = 1.0)")
+    ax.grid(alpha=0.25)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    return fig
+
+
+def fig_drawdowns(equity_df: pd.DataFrame, title: str):
+    dd = equity_df / equity_df.cummax() - 1.0
+    fig, ax = plt.subplots(figsize=(PLOT_W, PLOT_H))
+    for col in dd.columns:
+        ax.plot(dd.index, dd[col], label=col, linewidth=1.4)
+    ax.set_title(title)
+    ax.set_ylabel("Drawdown")
+    ax.grid(alpha=0.25)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    return fig
+
+
+# -----------------------------
+# UI components
+# -----------------------------
+def hero(title: str, subtitle: str):
     st.markdown(
-        """
+        f"""
         <div class="hero">
-          <div class="blur1"></div>
-          <div class="blur2"></div>
-          <div style="position:relative;">
-            <div style="font-weight:600; color: rgba(255,255,255,0.85);">✨ Neural Studio</div>
-            <h1>Build, Train, Evaluate & Deploy</h1>
-            <div style="max-width: 800px; color: rgba(255,255,255,0.80); font-size: 15px;">
-              A guided, professional machine learning workflow UI — from upload to predictions — with modern design.
-            </div>
-          </div>
+            <h1>{title}</h1>
+            <p>{subtitle}</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    st.write("")
-    c1, c2 = st.columns(2, gap="large")
+
+def info_card(title: str, body: str):
+    st.markdown(
+        f"""
+        <div class="card">
+            <div class="section-title">{title}</div>
+            <div class="small-muted">{body}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def top_status_bar():
+    raw_df = st.session_state.get("raw_df")
+    processed = st.session_state.get("processed")
+    training = st.session_state.get("training")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows Loaded", 0 if raw_df is None else len(raw_df))
+    c2.metric("Features Selected", len(st.session_state["config"].get("feature_cols", [])))
+    c3.metric("Targets Selected", len(st.session_state["config"].get("target_cols", [])))
+    c4.metric("Model Status", "Ready" if training is not None else ("Preprocessed" if processed is not None else "Not Trained"))
+
+
+# -----------------------------
+# Pages
+# -----------------------------
+def page_home():
+    hero(APP_TITLE, APP_SUBTITLE)
+    top_status_bar()
+    st.markdown(
+        """
+        <div class="card">
+            <div class="section-title">What this app actually does</div>
+            <div class="small-muted">
+                It takes multivariate oil and gas time-series data, cleans it, converts it to raw values or returns,
+                builds rolling LSTM sequences, trains a stacked LSTM forecaster, evaluates forecast quality, produces
+                deep diagnostics, and optionally simulates signal-driven strategy curves when you model returns.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3 = st.columns(3)
     with c1:
-        st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
-        st.button("➕ New Project", use_container_width=True, on_click=lambda: (new_project(), request_nav("data")))
-        st.markdown("</div>", unsafe_allow_html=True)
+        info_card("Workflow", "Home → Data Upload → Model → Preprocess → Train → Evaluate → Predict → Visualize → Save/Load")
     with c2:
-        st.markdown('<div class="btn-row">', unsafe_allow_html=True)
-        if st.button("📂 Open Current Project", use_container_width=True):
-            if ensure_current_project() is None:
-                st.warning("No current project found. Create one first.")
-            else:
-                request_nav("data")
-        st.markdown("</div>", unsafe_allow_html=True)
+        info_card("Best Use Case", "Daily or weekly oil, gas, refined product, or energy-market datasets with a date column and multiple numeric series")
+    with c3:
+        info_card("Built For", "WTI, Brent, Natural Gas, Heating Oil, Diesel, LPG, or any structured commodity time series with enough history")
 
-    st.write("")
-    st.subheader("Features")
-    feats = [
-        ("📤", "Upload Data", "CSV/Excel upload with preview & column selection"),
-        ("🧠", "Choose Model", "ANN for tabular • LSTM for sequences/time-series"),
-        ("🧹", "Preprocess", "Split + LSTM lookback/horizon settings"),
-        ("🏋️", "Train", "Real training + saved model artifacts"),
-        ("✅", "Evaluate", "Metrics + labeled confusion matrix / regression KPIs"),
-        ("🔮", "Predict", "ANN manual/batch • LSTM forecast/regression • LSTM classification next-step label"),
-        ("📊", "Visualize", "GitHub-style plots (ROC/PR/Threshold + Residuals + Actual vs Predicted)"),
-        ("💾", "Save/Load", "Download & restore project JSON"),
-        ("⚡", "Performance", "Lazy-loaded TF/sklearn/matplotlib for faster startup"),
-    ]
-    cols = st.columns(4)
-    for i, (ico, title, desc) in enumerate(feats):
-        with cols[i % 4]:
-            st.markdown(
-                f"""
-                <div class="ns-card" style="min-height: 140px;">
-                  <div style="font-size:28px; margin-bottom:6px;">{ico}</div>
-                  <div style="font-weight:800; font-size:16px;">{title}</div>
-                  <div class="muted" style="margin-top:4px; font-size:13px;">{desc}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+    st.subheader("Expected input structure")
+    st.code(
+        "date,WTI,Brent,NaturalGas,HeatingOil,Diesel\n"
+        "2020-01-01,61.17,66.25,2.12,1.98,2.01\n"
+        "2020-01-02,62.02,67.10,2.18,2.01,2.03\n"
+        "...",
+        language="text",
+    )
 
-    st.write("")
-    st.subheader("Recent Projects")
-    projects = get_projects()
-    if not projects:
-        st.info("No saved projects yet.")
-    else:
-        grid = st.columns(3)
-        for i, p in enumerate(projects[:6]):
-            with grid[i % 3]:
-                st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-                st.markdown(f"**{p.get('name', 'Untitled')}**")
-                st.caption(project_badge(p))
-                ds = p.get("dataset", {})
-                st.write(f"Dataset: {ds.get('filename', '—')}")
-                st.write(f"Rows: {ds.get('rows', 0)} • Cols: {ds.get('cols', 0)} • Missing: {ds.get('missing', 0)}")
-                if st.button("Open Project", key=f"open_{p.get('id')}"):
-                    set_current_project(p)
-                    request_nav("data")
-                st.markdown("</div>", unsafe_allow_html=True)
+    st.subheader("Hard truth before you start")
+    st.write(
+        "If your data is short, dirty, inconsistent, or mostly noise, the model will not magically become good because it is an LSTM. "
+        "Most bad forecasting projects are bad data projects wearing a neural-network costume."
+    )
 
 
-def page_data():
-    p = ensure_current_project()
-    if p is None:
-        st.warning("No current project. Go to Home and create a new project.")
-        return
-
-    st.title("Data Upload")
-    status_bar(p.get("status", "data_loaded"))
-
-    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-    st.write("### Upload Dataset (CSV or Excel)")
-    uploaded = st.file_uploader("Upload a CSV or Excel file", type=["csv", "xlsx", "xls"])
-
-    df = None
-    sheet_name = None
-    file_type = None
+def page_data_upload():
+    hero("Data Upload", "Load oil and gas market data and inspect it before you poison the model with garbage.")
+    uploaded = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx", "xls"], key="main_uploader")
 
     if uploaded is not None:
-        name = uploaded.name.lower()
         try:
-            if name.endswith(".csv"):
-                df = pd.read_csv(uploaded)
-                file_type = "csv"
-            else:
-                xls = pd.ExcelFile(uploaded)
-                sheet_name = st.selectbox("Select sheet", xls.sheet_names, index=0)
-                df = pd.read_excel(uploaded, sheet_name=sheet_name)
-                file_type = "excel"
+            df = read_uploaded_data(uploaded)
+            st.session_state["raw_df"] = df
+            st.session_state["loaded_filename"] = uploaded.name
+            reset_after_data_change()
+            detected_date = detect_date_column(df)
+            if detected_date and not st.session_state["config"].get("date_col"):
+                st.session_state["config"]["date_col"] = detected_date
+            st.success(f"Loaded {uploaded.name} with shape {df.shape}.")
         except Exception as e:
-            st.error(f"Could not read file: {e}")
-            st.markdown("</div>", unsafe_allow_html=True)
-            return
+            st.error(f"File load failed: {e}")
 
-    st.markdown("</div>", unsafe_allow_html=True)
+    df = st.session_state.get("raw_df")
+    if df is None:
+        st.info("Upload a dataset first.")
+        return
 
-    if df is not None:
-        df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
-        missing = int(df.isna().sum().sum())
-        p["train_config"].update(auto_train_defaults_from_df(df))
+    st.write(f"**Loaded file:** {st.session_state.get('loaded_filename')}  ")
+    st.dataframe(df.head(20), use_container_width=True)
 
-        DATASETS_DIR = DATA_DIR / "datasets"
-        DATASETS_DIR.mkdir(exist_ok=True)
+    detected_date = detect_date_column(df)
+    numeric_cols = get_numeric_columns(df, exclude=[detected_date] if detected_date else [])
 
-        suffix = ".csv" if file_type == "csv" else ".xlsx"
-        dataset_path = DATASETS_DIR / f"{p['id']}{suffix}"
-        with open(dataset_path, "wb") as f:
-            f.write(uploaded.getbuffer())
-
-        try:
-            cached_load_dataset.clear()
-        except Exception:
-            pass
-
-        p["dataset"] = {
-            "filename": uploaded.name,
-            "rows": int(df.shape[0]),
-            "cols": int(df.shape[1]),
-            "missing": missing,
-            "path": str(dataset_path),
-            "file_type": file_type,
-            "sheet": sheet_name,
-        }
-        p["raw_preview"] = df.head(10).to_dict(orient="records")
-        p["raw_columns"] = df.columns.tolist()
-        p["status"] = "data_loaded"
-        p["evaluation_metrics"] = None
-        p["artifacts"] = None
-        p["history"] = {"loss": [], "val_loss": []}
-        p.setdefault("viz_cache", {})
-        p["viz_cache"].clear()
-        p["target_profile"] = {}
-
-        p["columns"]["target"] = None
-        p["columns"]["time"] = None
-        p["columns"]["features"] = []
-        p["feature_meta"] = {}
-
-        upsert_project(p)
-
-    ds = p.get("dataset", {})
-    st.write("")
-    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-    st.write("### Dataset Information")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Filename", ds.get("filename", "—"))
-    c2.metric("Rows", ds.get("rows", 0))
-    c3.metric("Columns", ds.get("cols", 0))
-    mv = ds.get("missing", 0)
-    c4.metric("Missing Values", mv)
-    if mv and mv > 0:
-        st.warning("Missing values detected — handled automatically during training.")
-    st.markdown("</div>", unsafe_allow_html=True)
+    c1.metric("Rows", len(df))
+    c2.metric("Columns", df.shape[1])
+    c3.metric("Detected Date Column", detected_date or "None")
+    c4.metric("Numeric-like Columns", len(numeric_cols))
 
-    cols = p.get("raw_columns", [])
-    if cols:
-        st.write("")
-        st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-        st.write("### Column Configuration")
-
-        saved_target = p.get("columns", {}).get("target")
-        target = st.selectbox("Target Column (what to predict)", cols, index=_safe_index(cols, saved_target, 0))
-
-        time_options = ["(None)"] + [c for c in cols if c != target]
-        saved_time = p.get("columns", {}).get("time")
-        time_default = "(None)" if (saved_time is None or saved_time == target or saved_time not in time_options) else saved_time
-        time_col = st.selectbox("Time Column (optional, for time ordering)", time_options, index=_safe_index(time_options, time_default, 0))
-
-        feature_options = [c for c in cols if c != target]
-        saved_features = p.get("columns", {}).get("features", []) or []
-        safe_defaults = [c for c in saved_features if c in feature_options]
-        if not safe_defaults:
-            safe_defaults = feature_options[: min(6, len(feature_options))]
-
-        features = st.multiselect("Feature Columns (inputs)", feature_options, default=safe_defaults)
-
-        p["columns"]["target"] = target
-        p["columns"]["time"] = None if time_col == "(None)" else time_col
-        p["columns"]["features"] = [c for c in features if c != target]
-
-        try:
-            ds_path = p.get("dataset", {}).get("path")
-            ds_type = p.get("dataset", {}).get("file_type")
-            ds_sheet = p.get("dataset", {}).get("sheet")
-            if ds_path and p["columns"]["features"]:
-                p["feature_meta"] = cached_feature_meta(ds_path, ds_type, ds_sheet, tuple(p["columns"]["features"]))
-            else:
-                p["feature_meta"] = {}
-        except Exception:
-            p["feature_meta"] = {}
-
-        upsert_project(p)
-
-        st.caption(f"Selected features: {len(p['columns']['features'])}")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        st.write("")
-        st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-        st.write("### Data Preview")
-
-        if "data_preview_rows" not in st.session_state:
-            st.session_state["data_preview_rows"] = 10
-
-        n_rows = st.number_input(
-            "Number of uploaded rows shown",
-            min_value=1,
-            step=1,
-            value=int(st.session_state["data_preview_rows"]),
-            key="data_preview_rows",
+    left, right = st.columns([1.2, 1])
+    with left:
+        st.pyplot(fig_missing_bars(df, "Missing Values by Column"), use_container_width=True)
+    with right:
+        profile = pd.DataFrame(
+            {
+                "column": df.columns,
+                "dtype": [str(x) for x in df.dtypes],
+                "missing": df.isna().sum().values,
+                "missing_%": (df.isna().mean().values * 100.0).round(2),
+            }
         )
-
-        try:
-            df_full = load_project_dataset(p)
-            st.dataframe(df_full.head(int(n_rows)), use_container_width=True, height=360)
-        except Exception:
-            preview = p.get("raw_preview", [])
-            if preview:
-                st.dataframe(pd.DataFrame(preview).head(int(n_rows)), use_container_width=True, height=360)
-            else:
-                st.info("Upload a dataset to preview rows.")
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        st.write("")
-        c1, c2 = st.columns(2, gap="large")
-        with c1:
-            st.markdown('<div class="btn-row">', unsafe_allow_html=True)
-            st.button("⬅ Back to Home", use_container_width=True, on_click=request_nav, args=("home",))
-            st.markdown("</div>", unsafe_allow_html=True)
-        with c2:
-            st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
-            st.button("Continue to Model ➜", use_container_width=True, on_click=request_nav, args=("model",))
-            st.markdown("</div>", unsafe_allow_html=True)
-    else:
-        st.info("Upload a CSV/Excel to enable column selection and preview.")
+        st.dataframe(profile, use_container_width=True, hide_index=True)
 
 
 def page_model():
-    p = ensure_current_project()
-    if p is None:
-        st.warning("No current project.")
+    hero("Model", "Set forecasting targets, sequence design, and network architecture.")
+    df = st.session_state.get("raw_df")
+    if df is None:
+        st.info("Load data first.")
         return
 
-    st.title("Model")
-    status_bar(p.get("status", "data_loaded"))
+    cfg = st.session_state["config"]
+    guessed_date = detect_date_column(df)
+    numeric_cols = get_numeric_columns(df, exclude=[guessed_date] if guessed_date else [])
+    if guessed_date and (cfg["date_col"] is None or cfg["date_col"] not in df.columns):
+        cfg["date_col"] = guessed_date
+    if not cfg["feature_cols"]:
+        cfg["feature_cols"] = numeric_cols[:]
+    if not cfg["target_cols"]:
+        cfg["target_cols"] = numeric_cols[: min(4, len(numeric_cols))]
 
-    def _apply_model_change():
-        p2 = ensure_current_project()
-        if not p2:
-            return
-        key = f"model_type__{p2['id']}"
-        new_model = st.session_state.get(key, "ann")
-        p2["model_type"] = new_model
-
-        p2["evaluation_metrics"] = None
-        p2["artifacts"] = None
-        p2["history"] = {"loss": [], "val_loss": []}
-        p2.setdefault("viz_cache", {})
-        p2["viz_cache"].clear()
-
-        p2["status"] = "configured"
-        upsert_project(p2)
-
-        if new_model == "cnn":
-            goto("cnn")
-        else:
-            st.rerun()
-
-    def _apply_task_change():
-        p2 = ensure_current_project()
-        if not p2:
-            return
-        key = f"task_type__{p2['id']}"
-        new_task = st.session_state.get(key, "auto-detect")
-        p2["task_type"] = new_task
-
-        p2["evaluation_metrics"] = None
-        p2["artifacts"] = None
-        p2["history"] = {"loss": [], "val_loss": []}
-        p2.setdefault("viz_cache", {})
-        p2["viz_cache"].clear()
-
-        p2["status"] = "configured"
-        upsert_project(p2)
-        st.rerun()
-
-    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-    st.write("### Model Type")
-
-    default_model = p.get("model_type", "ann")
-    if default_model not in ["ann", "lstm", "cnn"]:
-        default_model = "ann"
-
-    st.session_state.setdefault(f"model_type__{p['id']}", default_model)
-
-    model_options = ["ann", "lstm", "cnn"]
-    current_model = st.session_state[f"model_type__{p['id']}"]
-
-    st.radio(
-        "Choose",
-        model_options,
-        index=_safe_index(model_options, current_model, 0),
-        horizontal=True,
-        key=f"model_type__{p['id']}",
-        on_change=_apply_model_change,
-    )
-
-    p["model_type"] = st.session_state[f"model_type__{p['id']}"]
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # CNN selected -> go straight to CNN page
-    if p["model_type"] == "cnn":
-        st.info("CNN selected. Open the dedicated CNN interface.")
-        st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
-        st.button("Open CNN Interface ➜", use_container_width=True, on_click=goto, args=("cnn",))
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        p["status"] = "configured"
-        upsert_project(p)
-
-        st.write("")
-        c1, c2 = st.columns(2, gap="large")
+    with st.form("model_form"):
+        c1, c2 = st.columns(2)
         with c1:
-            st.markdown('<div class="btn-row">', unsafe_allow_html=True)
-            st.button("⬅ Back to Data", use_container_width=True, on_click=request_nav, args=("data",))
-            st.markdown("</div>", unsafe_allow_html=True)
+            cfg["project_name"] = st.text_input("Project name", value=cfg["project_name"])
+            cfg["date_col"] = st.selectbox("Date column", options=[None] + list(df.columns), index=([None] + list(df.columns)).index(cfg["date_col"]) if cfg["date_col"] in df.columns else 0)
+            cfg["feature_cols"] = st.multiselect("Feature columns", options=numeric_cols, default=[c for c in cfg["feature_cols"] if c in numeric_cols])
+            cfg["target_cols"] = st.multiselect("Target columns", options=numeric_cols, default=[c for c in cfg["target_cols"] if c in numeric_cols])
+            cfg["lookback"] = st.number_input("Lookback window", min_value=2, max_value=365, value=int(cfg["lookback"]), step=1)
+            cfg["horizon"] = st.number_input("Forecast horizon", min_value=1, max_value=30, value=int(cfg["horizon"]), step=1)
         with c2:
-            st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
-            st.button("Go to CNN Page ➜", use_container_width=True, on_click=goto, args=("cnn",))
-            st.markdown("</div>", unsafe_allow_html=True)
-        return
+            cfg["lstm_units_1"] = st.number_input("LSTM units 1", min_value=8, max_value=512, value=int(cfg["lstm_units_1"]), step=8)
+            cfg["lstm_units_2"] = st.number_input("LSTM units 2", min_value=8, max_value=512, value=int(cfg["lstm_units_2"]), step=8)
+            cfg["lstm_units_3"] = st.number_input("LSTM units 3", min_value=8, max_value=512, value=int(cfg["lstm_units_3"]), step=8)
+            cfg["dense_units"] = st.number_input("Dense units", min_value=8, max_value=512, value=int(cfg["dense_units"]), step=8)
+            cfg["dropout"] = st.slider("Dropout", min_value=0.0, max_value=0.8, value=float(cfg["dropout"]), step=0.05)
+            cfg["loss"] = st.selectbox("Loss", ["mse", "mae", "huber"], index=["mse", "mae", "huber"].index(cfg["loss"]))
+            cfg["seed"] = st.number_input("Random seed", min_value=0, max_value=999999, value=int(cfg["seed"]), step=1)
+        submitted = st.form_submit_button("Save Model Settings")
 
-    st.write("")
-    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-    st.write("### Task Type")
+    if submitted:
+        reset_after_data_change()
+        st.success("Model configuration saved.")
 
-    options = ["auto-detect", "classification", "regression"]
-    current = p.get("task_type", "auto-detect")
-    if current not in options:
-        current = "auto-detect"
-    st.session_state.setdefault(f"task_type__{p['id']}", current)
+    st.markdown("### Model Design Summary")
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Features", len(cfg["feature_cols"]))
+    s2.metric("Targets", len(cfg["target_cols"]))
+    s3.metric("Lookback", int(cfg["lookback"]))
+    s4.metric("Horizon", int(cfg["horizon"]))
 
-    st.selectbox(
-        "Task",
-        options,
-        index=_safe_index(options, st.session_state[f"task_type__{p['id']}"], 0),
-        key=f"task_type__{p['id']}",
-        on_change=_apply_task_change,
-    )
-    p["task_type"] = st.session_state[f"task_type__{p['id']}"]
+    a, b = st.columns(2)
+    with a:
+        st.markdown("**Selected Inputs**")
+        st.dataframe(pd.DataFrame({"Feature Columns": cfg["feature_cols"]}), use_container_width=True, hide_index=True, height=260)
+    with b:
+        st.markdown("**Prediction Targets**")
+        st.dataframe(pd.DataFrame({"Target Columns": cfg["target_cols"]}), use_container_width=True, hide_index=True, height=260)
 
-    if p["model_type"] == "ann":
-        st.caption("ANN supports classification and regression on tabular datasets.")
-    else:
-        st.caption("LSTM supports sequence regression (forecasting) AND sequence classification (label prediction at horizon).")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.write("")
-    if p["model_type"] == "ann":
-        st.markdown('<div class="ns-card" style="background:#faf5ff; border-color:#ddd6fe;">', unsafe_allow_html=True)
-        st.write("### ANN Configuration")
-        p.setdefault("ann_config", {})
-        p["ann_config"]["hidden_layers"] = st.number_input(
-            "Hidden layers",
-            min_value=1,
-            max_value=12,
-            value=int(p["ann_config"].get("hidden_layers", 3)),
-            key=f"ann_hl__{p['id']}",
-        )
-        hl = int(p["ann_config"]["hidden_layers"])
-        neurons = p["ann_config"].get("neurons", [256, 128, 64])
-        if not isinstance(neurons, list):
-            neurons = [256, 128, 64]
-        neurons = (neurons + [64] * hl)[:hl]
-        new_neurons = []
-        for i in range(hl):
-            new_neurons.append(
-                int(
-                    st.number_input(
-                        f"Neurons in layer {i + 1}",
-                        min_value=1,
-                        max_value=2048,
-                        value=int(neurons[i]),
-                        key=f"ann_n_{i}__{p['id']}",
-                    )
-                )
-            )
-        p["ann_config"]["neurons"] = new_neurons
-        p["ann_config"]["activation"] = st.selectbox(
-            "Activation",
-            ["ReLU", "Tanh", "Sigmoid"],
-            index=_safe_index(["ReLU", "Tanh", "Sigmoid"], p["ann_config"].get("activation", "ReLU"), 0),
-            key=f"ann_act__{p['id']}",
-        )
-        p["ann_config"]["output_activation"] = st.selectbox(
-            "Output activation",
-            ["Auto", "Linear", "Sigmoid", "Softmax"],
-            index=_safe_index(["Auto", "Linear", "Sigmoid", "Softmax"], p["ann_config"].get("output_activation", "Auto"), 0),
-            key=f"ann_outact__{p['id']}",
-        )
-        p["ann_threshold"] = float(
-            st.slider("Binary classification threshold (used in Predict)", 0.05, 0.95, float(p.get("ann_threshold", 0.5)))
-        )
-
-        st.caption("ANN settings apply during training. Threshold applies during prediction for binary classification.")
-        st.markdown("</div>", unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="ns-card" style="background:#ecfeff; border-color:#a5f3fc;">', unsafe_allow_html=True)
-        st.write("### LSTM Configuration (Multivariate)")
-        p.setdefault("lstm_config", {})
-        p["lstm_config"]["units"] = st.number_input(
-            "LSTM units",
-            min_value=1,
-            max_value=2048,
-            value=int(p["lstm_config"].get("units", 64)),
-            key=f"lstm_units__{p['id']}",
-        )
-        p["lstm_config"]["layers"] = st.number_input(
-            "Number of LSTM layers (stored)",
-            min_value=1,
-            max_value=6,
-            value=int(p["lstm_config"].get("layers", 2)),
-            key=f"lstm_layers__{p['id']}",
-        )
-        p["lstm_config"]["dropout"] = st.slider(
-            "Dropout rate",
-            0.0,
-            0.8,
-            float(p["lstm_config"].get("dropout", 0.2)),
-            key=f"lstm_do__{p['id']}",
-        )
-        p["lstm_config"]["bidirectional"] = st.checkbox(
-            "Bidirectional (stored)",
-            value=bool(p["lstm_config"].get("bidirectional", False)),
-            key=f"lstm_bi__{p['id']}",
-        )
-        st.caption("LSTM uses selected FEATURES + past TARGET. For classification, it predicts the label at the horizon.")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    p["status"] = "configured" if p.get("status") in ["data_loaded", "configured"] else p.get("status")
-    upsert_project(p)
-
-    st.write("")
-    c1, c2 = st.columns(2, gap="large")
-    with c1:
-        st.markdown('<div class="btn-row">', unsafe_allow_html=True)
-        st.button("⬅ Back to Data", use_container_width=True, on_click=request_nav, args=("data",))
-        st.markdown("</div>", unsafe_allow_html=True)
-    with c2:
-        st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
-        st.button("Continue to Preprocess ➜", use_container_width=True, on_click=request_nav, args=("preprocess",))
-        st.markdown("</div>", unsafe_allow_html=True)
+    with st.expander("Full configuration", expanded=False):
+        st.code(json.dumps(cfg, indent=2, default=str), language="json")
 
 
 def page_preprocess():
-    p = ensure_current_project()
-    if p is None:
-        st.warning("No current project.")
+    hero("Preprocess", "Clean the series, transform it, split it sequentially, and build LSTM windows.")
+    df = st.session_state.get("raw_df")
+    if df is None:
+        st.info("Load data first.")
         return
 
-    st.title("Preprocess")
-    status_bar(p.get("status", "data_loaded"))
+    cfg = st.session_state["config"]
+    with st.form("preprocess_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            cfg["transform_mode"] = st.selectbox(
+                "Target/data transform",
+                ["raw", "pct_change", "log_return"],
+                index=["raw", "pct_change", "log_return"].index(cfg["transform_mode"]),
+            )
+            cfg["missing_method"] = st.selectbox(
+                "Missing value handling",
+                ["ffill_bfill", "interpolate", "drop", "ffill", "bfill", "median_impute"],
+                index=["ffill_bfill", "interpolate", "drop", "ffill", "bfill", "median_impute"].index(cfg["missing_method"]),
+            )
+            cfg["resample_rule"] = st.selectbox("Resample rule", ["None", "D", "W", "M"], index=["None", "D", "W", "M"].index(cfg["resample_rule"]))
+        with c2:
+            cfg["scale_method"] = st.selectbox("Scaling", ["standard", "minmax", "robust"], index=["standard", "minmax", "robust"].index(cfg["scale_method"]))
+            cfg["train_frac"] = st.slider("Train fraction", min_value=0.50, max_value=0.85, value=float(cfg["train_frac"]), step=0.05)
+            cfg["val_frac"] = st.slider("Validation fraction", min_value=0.05, max_value=0.30, value=float(cfg["val_frac"]), step=0.05)
+        with c3:
+            cfg["clip_outliers"] = st.checkbox("Clip outliers by quantile", value=bool(cfg["clip_outliers"]))
+            cfg["clip_low_q"] = st.number_input("Lower quantile", min_value=0.0, max_value=0.20, value=float(cfg["clip_low_q"]), step=0.005)
+            cfg["clip_high_q"] = st.number_input("Upper quantile", min_value=0.80, max_value=1.0, value=float(cfg["clip_high_q"]), step=0.005)
+        submitted = st.form_submit_button("Run Preprocessing")
 
-    ds = p.get("dataset", {})
-    cols_cfg = p.get("columns", {})
+    if submitted:
+        try:
+            if cfg["train_frac"] + cfg["val_frac"] >= 0.95:
+                raise ValueError("Train fraction + validation fraction must leave room for a test set.")
+            processed = preprocess_dataset(df, cfg)
+            st.session_state["processed"] = processed
+            st.session_state["training"] = None
+            st.session_state["prediction"] = None
+            st.success("Preprocessing complete.")
+        except Exception as e:
+            st.error(f"Preprocessing failed: {e}")
 
-    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-    st.write("### Dataset Summary")
-    st.write(f"**Project:** {p.get('name')}")
-    st.write(f"**Rows:** {ds.get('rows', 0)} • **Features:** {len(cols_cfg.get('features', []))} • **Target:** {cols_cfg.get('target', '—')}")
-    st.write(f"**Model:** {p.get('model_type', 'ann').upper()} • **Task:** {p.get('task_type', 'auto-detect')}")
-    st.markdown("</div>", unsafe_allow_html=True)
+    processed = st.session_state.get("processed")
+    if processed is None:
+        st.info("Configure preprocessing and click Run Preprocessing.")
+        return
 
-    st.write("")
-    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-    st.write("### Missing Values")
-    p["preprocess"]["missing_strategy"] = st.selectbox(
-        "Strategy",
-        ["Drop rows", "Fill with mean/median", "Forward fill (time-series)"],
-        index=_safe_index(
-            ["Drop rows", "Fill with mean/median", "Forward fill (time-series)"],
-            p["preprocess"].get("missing_strategy"),
-            0,
-        ),
-        key=f"miss__{p['id']}",
-    )
-    st.caption("ANN uses imputers automatically; LSTM does forward/back fill after encoding.")
-    st.markdown("</div>", unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Processed Rows", len(processed["transformed"]))
+    c2.metric("Train Sequences", len(processed["X_train"]))
+    c3.metric("Validation Sequences", len(processed["X_val"]))
+    c4.metric("Test Sequences", len(processed["X_test"]))
 
-    st.write("")
-    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-    st.write("### Train/Test Split")
-    split = st.slider("Train %", 50, 95, int(float(p["preprocess"].get("split", 0.8)) * 100), key=f"split__{p['id']}")
-    p["preprocess"]["split"] = split / 100.0
-    p["preprocess"]["seed"] = st.number_input("Random Seed", value=int(p["preprocess"].get("seed", 42)), step=1, key=f"seed__{p['id']}")
-    st.caption(f"Train: {split}% • Test: {100 - split}%")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.write("")
-    if p.get("model_type") == "lstm":
-        st.markdown('<div class="ns-card" style="border-color:#c4b5fd; background:#faf5ff;">', unsafe_allow_html=True)
-        st.write("### LSTM / Sequence Settings")
-        p["preprocess"]["lookback"] = st.number_input(
-            "Lookback window",
-            value=int(p["preprocess"].get("lookback", 20)),
-            min_value=1,
-            step=1,
-            key=f"lookback__{p['id']}",
-        )
-        p["preprocess"]["horizon"] = st.number_input(
-            "Horizon (steps ahead)",
-            value=int(p["preprocess"].get("horizon", 1)),
-            min_value=1,
-            step=1,
-            key=f"horizon__{p['id']}",
-        )
-        st.caption("LSTM uses past lookback rows to predict the target at the selected horizon.")
-        st.markdown("</div>", unsafe_allow_html=True)
-    else:
-        st.info("You selected ANN. Sequence settings are hidden because they are only needed for LSTM.")
-
-    p["status"] = "preprocessed" if p.get("status") in ["configured", "preprocessed"] else p.get("status")
-    upsert_project(p)
-
-    st.write("")
-    c1, c2 = st.columns(2, gap="large")
-    with c1:
-        st.markdown('<div class="btn-row">', unsafe_allow_html=True)
-        st.button("⬅ Back to Model", use_container_width=True, on_click=request_nav, args=("model",))
-        st.markdown("</div>", unsafe_allow_html=True)
-    with c2:
-        st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
-        st.button(
-            "Continue to Training ➜",
+    st.markdown("**Sequential Data Split Overview**")
+    split_left, split_center, split_right = st.columns([1, 2.4, 1])
+    with split_center:
+        st.pyplot(
+            fig_split_overview(processed["dates"], processed["train_end_idx"], processed["val_end_idx"], "Sequential Data Split Overview"),
             use_container_width=True,
-            on_click=lambda: (p.__setitem__("status", "preprocessed"), upsert_project(p), request_nav("train")),
         )
-        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.write("**Transformed data preview**")
+    preview = processed["transformed"].copy()
+    preview.insert(0, "date", processed["dates"])
+    st.dataframe(preview.head(20), use_container_width=True)
 
 
 def page_train():
-    p = ensure_current_project()
-    if p is None:
-        st.warning("No current project.")
+    hero("Train", "Train the LSTM and keep the best checkpoint instead of praying at a random epoch.")
+    processed = st.session_state.get("processed")
+    if processed is None:
+        st.info("Preprocess data first.")
         return
 
-    st.title("Train")
-    status_bar(p.get("status", "data_loaded"))
-
-    ds = p.get("dataset", {})
-    features = p.get("columns", {}).get("features", [])
-
-    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-    st.write("### Model Summary")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Architecture", p.get("model_type", "—").upper())
-    c2.metric("Task", p.get("task_type", "—"))
-    c3.metric("Features", len(features))
-    train_samples = int(ds.get("rows", 0) * float(p["preprocess"]["split"])) if ds.get("rows", 0) else 0
-    c4.metric("Training Samples", train_samples)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.write("")
-    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-    st.write("### Training Configuration")
+    cfg = st.session_state["config"]
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        p["train_config"]["epochs"] = int(
-            st.number_input(
-                "Epochs",
-                min_value=1,
-                value=int(p["train_config"]["epochs"]),
-                step=1,
-                key=f"ep__{p['id']}"
-            )
-        )
+        cfg["epochs"] = st.number_input("Epochs", min_value=1, max_value=1000, value=int(cfg["epochs"]), step=1)
     with c2:
-        p["train_config"]["batch_size"] = int(
-            st.number_input("Batch size", min_value=1, max_value=2048, value=int(p["train_config"]["batch_size"]), key=f"bs__{p['id']}")
-        )
+        cfg["batch_size"] = st.number_input("Batch size", min_value=1, max_value=1024, value=int(cfg["batch_size"]), step=1)
     with c3:
-        if p.get("model_type") == "ann":
-            p["train_config"]["lr"] = float(
-                st.number_input(
-                    "Learning rate (ANN)",
-                    min_value=1e-6,
-                    max_value=1.0,
-                    value=float(p["train_config"]["lr"]),
-                    format="%.6f",
-                    key=f"lr__{p['id']}",
-                )
-            )
-        else:
-            st.markdown("**Learning rate**")
-            st.caption("Used internally by LSTM optimizer (fixed).")
+        cfg["learning_rate"] = st.number_input("Learning rate", min_value=1e-6, max_value=1.0, value=float(cfg["learning_rate"]), format="%.6f")
     with c4:
-        p["train_config"]["patience"] = int(
-            st.number_input("Early stop patience", min_value=1, max_value=50, value=int(p["train_config"]["patience"]), key=f"pat__{p['id']}")
-        )
+        cfg["patience"] = st.number_input("Early stopping patience", min_value=1, max_value=200, value=int(cfg["patience"]), step=1)
 
-    p["train_config"]["early_stop"] = st.checkbox("Enable early stopping", value=bool(p["train_config"]["early_stop"]), key=f"es__{p['id']}")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    upsert_project(p)
-
-    st.write("")
-    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-    st.write("### Training Controls")
-    st.markdown('<div class="btn-row btn-emerald">', unsafe_allow_html=True)
-    run = st.button("▶ Start Training", use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    if run:
-        dataset_path = ds.get("path")
-        if not dataset_path:
-            st.error("No dataset saved. Go to Data page and upload a file.")
-            return
-
-        target = p.get("columns", {}).get("target")
-        time_col = p.get("columns", {}).get("time")
-        feature_cols = p.get("columns", {}).get("features", [])
-
-        if not target:
-            st.error("Select target in Data page first.")
-            return
-
+    train_now = st.button("Start Training", type="primary")
+    if train_now:
         try:
-            df = load_project_dataset(p)
+            with st.spinner("Training model..."):
+                training = train_model(processed, cfg)
+            st.session_state["training"] = training
+            st.success("Training complete.")
         except Exception as e:
-            st.error(f"Failed to load dataset: {e}")
-            return
+            st.error(f"Training failed: {e}")
 
-        epochs = int(p["train_config"]["epochs"])
-        batch_size = int(p["train_config"]["batch_size"])
-        lr = float(p["train_config"].get("lr", 0.001))
-        early_stop = bool(p["train_config"]["early_stop"])
-        patience = int(p["train_config"]["patience"])
-        seed = int(p["preprocess"]["seed"])
-        test_size = 1.0 - float(p["preprocess"]["split"])
+    training = st.session_state.get("training")
+    if training is None:
+        st.info("Press Start Training.")
+        return
 
-        MODELS_DIR = DATA_DIR / "models" / p["id"]
-        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    st.markdown("### Training Summary")
+    t1, t2, t3, t4 = st.columns(4)
+    t1.metric("Train Sequences", len(processed["X_train"]))
+    t2.metric("Validation Sequences", len(processed["X_val"]))
+    t3.metric("Test Sequences", len(processed["X_test"]))
+    t4.metric("Input Shape", f"{processed['X_train'].shape[1]} × {processed['X_train'].shape[2]}")
 
-        # reset caches
-        p.setdefault("viz_cache", {})
-        p["viz_cache"].clear()
+    t5, t6, t7, t8 = st.columns(4)
+    t5.metric("Epochs", int(cfg["epochs"]))
+    t6.metric("Batch Size", int(cfg["batch_size"]))
+    t7.metric("Learning Rate", f"{float(cfg['learning_rate']):.6f}")
+    t8.metric("Patience", int(cfg["patience"]))
 
-        if p.get("model_type") == "ann":
-            if not feature_cols:
-                st.error("Select feature columns in Data page first (ANN needs features).")
-                return
+    hist_left, hist_center, hist_right = st.columns([1, 2.4, 1])
+    with hist_center:
+        st.pyplot(fig_training_history(training["history"]), use_container_width=True)
 
-            ui_task = p.get("task_type", "auto-detect")
-            task_choice = "auto" if ui_task == "auto-detect" else ui_task
+    with st.container(border=True):
+        st.markdown("**Model summary**")
+        st.code(training["model_summary"], language="text")
 
-            try:
-                with st.spinner("Training model (ANN)..."):
-                    model, preprocessor, label_encoder, results, history = train_ann_from_df(
-                        df=df,
-                        target_col=target,
-                        feature_cols=feature_cols,
-                        task_choice=task_choice,
-                        test_size=test_size,
-                        epochs=epochs,
-                        batch_size=batch_size,
-                        lr=lr,
-                        early_stop=early_stop,
-                        patience=patience,
-                        seed=seed,
-                        ann_config=p.get("ann_config", {}),
-                    )
-            except Exception as e:
-                st.error(f"ANN training could not start: {e}")
-                return
-
-            # Save regression plotting cache (y_test/y_pred) for Visualize
-            try:
-                if results.get("task") == "regression":
-                    sk = _get_sklearn()
-                    train_test_split = sk["train_test_split"]
-
-                    X_full = df[feature_cols].copy()
-                    y_full = pd.to_numeric(df[target], errors="coerce").astype(float).values
-
-                    keep = ~np.isnan(y_full)
-                    X_full = X_full.loc[keep].reset_index(drop=True)
-                    y_full = y_full[keep]
-                    X_full = _expand_datetime_features(X_full)
-
-                    X_train, X_test, y_train, y_test = train_test_split(
-                        X_full,
-                        y_full,
-                        test_size=test_size,
-                        random_state=seed,
-                        shuffle=True,
-                    )
-                    X_test_np = preprocessor.transform(X_test)
-                    y_pred = model.predict(X_test_np, verbose=0).reshape(-1)
-
-                    p["viz_cache"]["ann_regression"] = {"y_test": y_test.tolist(), "y_pred": y_pred.tolist()}
-            except Exception:
-                pass
-
-            model_path = MODELS_DIR / "model.keras"
-            prep_path = MODELS_DIR / "preprocessor.joblib"
-            le_path = MODELS_DIR / "label_encoder.joblib"
-
-            model.save(model_path)
-            joblib.dump(preprocessor, prep_path)
-            joblib.dump(label_encoder, le_path)
-
-            try:
-                cached_load_ann_artifacts.clear()
-            except Exception:
-                pass
-
-            p["artifacts"] = {
-                "kind": "ann",
-                "model_path": str(model_path),
-                "preprocessor_path": str(prep_path),
-                "label_encoder_path": str(le_path),
-            }
-
-            try:
-                p["target_profile"] = build_target_profile(df, target)
-            except Exception:
-                p["target_profile"] = {}
-
-            p["history"] = history
-            p["evaluation_metrics"] = results
-            p["status"] = "trained"
-            upsert_project(p)
-
-            st.success("Training finished (ANN). You can now Evaluate → Predict → Visualize.")
-
-        else:
-            if not feature_cols:
-                st.error("For LSTM, please select feature columns in Data page.")
-                return
-
-            ui_task = p.get("task_type", "auto-detect")
-            lstm_task = "auto" if ui_task == "auto-detect" else ui_task
-
-            cfg = LSTMConfig(
-                target_col=target,
-                feature_cols=feature_cols,
-                date_col=time_col,
-                task=lstm_task,
-                lookback=int(p["preprocess"]["lookback"]),
-                horizon=int(p["preprocess"]["horizon"]),
-                test_size=float(test_size),
-                lstm_units=int(p.get("lstm_config", {}).get("units", 64)),
-                dropout=float(p.get("lstm_config", {}).get("dropout", 0.2)),
-                epochs=int(epochs),
-                batch_size=int(batch_size),
-                patience=int(patience),
-                seed=int(seed),
-                val_split=0.1,
-            )
-
-            with st.spinner("Training model (LSTM)..."):
-                model, pack, history, metrics, outputs = train_lstm_from_df(df, cfg)
-
-            if (metrics or {}).get("status") != "ok" or model is None or pack is None:
-                st.error((metrics or {}).get("message", "LSTM training could not start."))
-                warns = (metrics or {}).get("warnings", [])
-                if warns:
-                    st.warning("\n".join([f"• {w}" for w in warns]))
-                return
-
-            model_path = MODELS_DIR / "lstm_model.keras"
-            pack_path = MODELS_DIR / "lstm_pack.joblib"
-            outputs_path = MODELS_DIR / "lstm_outputs.npz"
-
-            model.save(model_path)
-            joblib.dump(pack, pack_path)
-            np.savez_compressed(outputs_path, **outputs)
-
-            try:
-                cached_load_lstm_artifacts.clear()
-            except Exception:
-                pass
-
-            used_lookback = int(outputs["lookback"][0]) if "lookback" in outputs else cfg.lookback
-
-            p["artifacts"] = {
-                "kind": "lstm",
-                "model_path": str(model_path),
-                "pack_path": str(pack_path),
-                "outputs_path": str(outputs_path),
-                "lookback": used_lookback,
-            }
-
-            try:
-                p["target_profile"] = build_target_profile(df, target)
-            except Exception:
-                p["target_profile"] = {}
-
-            p["history"] = {"loss": history.get("loss", []), "val_loss": history.get("val_loss", [])}
-            p["evaluation_metrics"] = metrics
-            p["status"] = "trained"
-            upsert_project(p)
-
-            st.success("Training finished (LSTM). You can now Evaluate → Predict → Visualize.")
-            if metrics.get("warnings"):
-                st.warning("\n".join([f"• {w}" for w in metrics["warnings"]]))
-
-    st.write("")
-    c1, c2 = st.columns(2, gap="large")
-    with c1:
-        st.markdown('<div class="btn-row">', unsafe_allow_html=True)
-        st.button("⬅ Back to Preprocess", use_container_width=True, on_click=request_nav, args=("preprocess",))
-        st.markdown("</div>", unsafe_allow_html=True)
-    with c2:
-        st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
-        st.button("Continue to Evaluate ➜", use_container_width=True, on_click=request_nav, args=("evaluate",))
-        st.markdown("</div>", unsafe_allow_html=True)
+    st.write("**Validation metrics**")
+    st.dataframe(training["metrics"]["val"], use_container_width=True, hide_index=True)
 
 
 def page_evaluate():
-    p = ensure_current_project()
-    if p is None:
-        st.warning("No current project.")
+    hero("Evaluate", "Check whether the model learned signal or just learned how to disappoint you more elegantly.")
+    training = st.session_state.get("training")
+    processed = st.session_state.get("processed")
+    if training is None or processed is None:
+        st.info("Train the model first.")
         return
 
-    st.title("Evaluate")
-    status_bar(p.get("status", "data_loaded"))
+    cfg = st.session_state["config"]
+    split = st.selectbox("Evaluation split", ["train", "val", "test"], index=2)
+    target = st.selectbox("Target", processed["target_cols"], index=0)
+    horizon_step = st.selectbox("Horizon step", list(range(1, int(cfg["horizon"]) + 1)), index=0)
 
-    if p.get("status") not in ["trained", "evaluated"]:
-        st.warning("Please train a model first.")
-        return
+    idx = processed["target_cols"].index(target)
+    h = horizon_step - 1
+    actual = training["actuals"][split][:, h, idx]
+    pred = training["predictions"][split][:, h, idx]
+    residuals = actual - pred
 
-    metrics = p.get("evaluation_metrics") or {}
-    if not metrics:
-        st.info("No evaluation metrics found. Train the model first.")
-        return
+    row = training["metrics"][split]
+    row = row[(row["target"] == target) & (row["horizon_step"] == horizon_step)].iloc[0]
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("MAE", f"{row['MAE']:.6f}")
+    c2.metric("RMSE", f"{row['RMSE']:.6f}")
+    c3.metric("MAPE %", f"{row['MAPE_%']:.2f}")
+    c4.metric("R²", f"{row['R2']:.4f}")
+    c5.metric("Directional Accuracy %", f"{row['Directional_Accuracy_%']:.2f}")
 
-    task = metrics.get("task", "classification")
-    is_cls = (task == "classification")
+    st.dataframe(training["metrics"][split], use_container_width=True, hide_index=True)
 
-    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-    st.write("### Key Metrics")
+    a, b = st.columns(2)
+    with a:
+        st.pyplot(fig_actual_vs_predicted(actual, pred, f"{split.title()} | {target} | Step {horizon_step}: Actual vs Predicted"), use_container_width=True)
+    with b:
+        st.pyplot(fig_distribution(actual, pred, f"{split.title()} | {target} | Actual vs Predicted Distribution"), use_container_width=True)
 
-    if is_cls:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Accuracy", f"{metrics.get('accuracy', 0.0) * 100:.1f}%")
-        c2.metric("Precision", f"{metrics.get('precision', 0.0) * 100:.1f}%")
-        c3.metric("Recall", f"{metrics.get('recall', 0.0) * 100:.1f}%")
-        c4.metric("F1 Score", f"{metrics.get('f1_score', 0.0) * 100:.1f}%")
+    c, d = st.columns(2)
+    with c:
+        st.pyplot(fig_scatter(actual, pred, f"{split.title()} | {target} | Scatter"), use_container_width=True)
+    with d:
+        st.pyplot(fig_residual_hist(residuals, f"{split.title()} | {target} | Residual Histogram"), use_container_width=True)
 
-        st.write("")
-        st.write("**Confusion Matrix** (rows=actual, cols=predicted)")
-        cm = np.array(metrics.get("confusion_matrix", [[0, 0], [0, 0]]), dtype=int)
-        labels = metrics.get("class_labels") or None
-        st.dataframe(pd.DataFrame(cm, index=labels, columns=labels) if labels else pd.DataFrame(cm), use_container_width=True)
+    e, f = st.columns(2)
+    with e:
+        st.pyplot(fig_residuals_vs_pred(pred, residuals, f"{split.title()} | {target} | Residuals vs Predicted"), use_container_width=True)
+    with f:
+        st.pyplot(fig_qq(residuals, f"{split.title()} | {target} | Residual QQ Plot"), use_container_width=True)
 
-        if metrics.get("classes", 0) == 2 and metrics.get("y_score") is not None and metrics.get("y_true") is not None:
-            st.caption("Binary classification: ROC/PR/Threshold curves are available in Visualize page.")
-    else:
-        c1, c2, c3 = st.columns(3)
-        c1.metric("MAE", f"{metrics.get('mae', 0.0):.4f}")
-        c2.metric("RMSE", f"{metrics.get('rmse', 0.0):.4f}")
-        c3.metric("R² Score", f"{float(metrics.get('r2_score', 0.0)):.4f}")
 
-        if "channels_used" in metrics:
-            st.write("")
-            st.write("**LSTM Details**")
-            st.write(f"Channels used: **{metrics.get('channels_used')}** (features + target)")
-            st.write(f"Lookback: **{metrics.get('lookback_used')}** • Horizon: **{metrics.get('horizon_used')}**")
-            st.write(f"Rows used: **{metrics.get('rows_used')}**")
-            st.write(f"Train sequences: **{metrics.get('train_sequences')}** • Test sequences: **{metrics.get('test_sequences')}**")
+def prepare_prediction_input(df_new: pd.DataFrame, processed: Dict, cfg: Dict) -> Tuple[np.ndarray, pd.DataFrame]:
+    feature_cols = processed["feature_cols"]
+    target_cols = processed["target_cols"]
+    date_col = cfg["date_col"]
+    work = df_new.copy()
 
-    st.markdown("</div>", unsafe_allow_html=True)
+    if date_col and date_col in work.columns:
+        work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+        work = work.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True)
 
-    p["status"] = "evaluated"
-    upsert_project(p)
+    needed = list(dict.fromkeys(feature_cols + target_cols))
+    missing = [c for c in needed if c not in work.columns]
+    if missing:
+        raise ValueError(f"New data is missing required columns: {missing}")
 
-    st.write("")
-    c1, c2 = st.columns(2, gap="large")
-    with c1:
-        st.markdown('<div class="btn-row">', unsafe_allow_html=True)
-        st.button("⬅ Back to Train", use_container_width=True, on_click=request_nav, args=("train",))
-        st.markdown("</div>", unsafe_allow_html=True)
-    with c2:
-        st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
-        st.button("Continue to Predict ➜", use_container_width=True, on_click=request_nav, args=("predict",))
-        st.markdown("</div>", unsafe_allow_html=True)
+    numeric = coerce_numeric(work[needed], needed)
+    if cfg["resample_rule"] != "None" and date_col and date_col in work.columns:
+        tmp = pd.concat([work[[date_col]], numeric], axis=1).set_index(date_col)
+        numeric = tmp.resample(cfg["resample_rule"]).mean().reset_index(drop=True)
+
+    numeric = apply_missing(numeric, cfg["missing_method"])
+    if cfg["clip_outliers"]:
+        numeric = clip_quantiles(numeric, cfg["clip_low_q"], cfg["clip_high_q"])
+    transformed = apply_transform(numeric, cfg["transform_mode"])
+    transformed = apply_missing(transformed, cfg["missing_method"]).dropna().reset_index(drop=True)
+
+    if len(transformed) < int(cfg["lookback"]):
+        raise ValueError("New data does not have enough rows for the configured lookback window.")
+
+    X = transformed[feature_cols].copy()
+    X_scaled = processed["feature_scaler"].transform(X)
+    last_window = X_scaled[-int(cfg["lookback"]) :]
+    return last_window[np.newaxis, :, :].astype(np.float32), numeric
+
+
+def implied_prices_from_returns(last_prices: pd.Series, pred_values: np.ndarray, transform_mode: str, target_cols: List[str]) -> pd.DataFrame:
+    pred_values = np.asarray(pred_values)
+    horizon = pred_values.shape[0]
+    out = []
+    running = last_prices[target_cols].astype(float).copy()
+    for h in range(horizon):
+        step_vals = pred_values[h]
+        if transform_mode == "pct_change":
+            running = running * (1.0 + step_vals)
+        elif transform_mode == "log_return":
+            running = running * np.exp(step_vals)
+        elif transform_mode == "raw":
+            running = pd.Series(step_vals, index=target_cols)
+        out.append(running.copy())
+    df = pd.DataFrame(out)
+    df.index = [f"step_{i+1}" for i in range(horizon)]
+    return df
 
 
 def page_predict():
-    p = ensure_current_project()
-    if p is None:
-        st.warning("No current project.")
+    hero("Predict", "Generate forecasts from the latest window or from a new dataset that matches the training schema.")
+    training = st.session_state.get("training")
+    processed = st.session_state.get("processed")
+    if training is None or processed is None:
+        st.info("Train the model first.")
         return
 
-    st.title("Predict")
-    status_bar(p.get("status", "data_loaded"))
+    cfg = st.session_state["config"]
+    source = st.radio("Prediction source", ["Use last window from loaded data", "Upload new data for prediction"], horizontal=True)
+    pred_df = None
 
-    artifacts = p.get("artifacts")
-    if not artifacts:
-        st.warning("No trained model found. Train the model first.")
-        return
-
-    kind = artifacts.get("kind", "ann")
-
-    if kind == "ann":
-        features = p.get("columns", {}).get("features", [])
-        if not features:
-            st.warning("No features selected. Go to Data Upload and select feature columns.")
-            return
-
-        try:
-            model, preprocessor, label_encoder = cached_load_ann_artifacts(
-                artifacts["model_path"],
-                artifacts["preprocessor_path"],
-                artifacts["label_encoder_path"],
-            )
-        except Exception as e:
-            st.error(f"Failed to load trained model artifacts: {e}")
-            return
-
-        target_name = (p.get("columns") or {}).get("target") or "target"
-        task = (p.get("evaluation_metrics") or {}).get("task", "classification")
-        threshold = float(p.get("ann_threshold", 0.5))
-
-        tab1, tab2 = st.tabs(["Manual Input", "Upload File"])
-
-        with tab1:
-            st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-            st.write("### Input Features")
-
-            st.caption(
-                f"**What will be predicted?** This model estimates **{target_name}** from the feature values you enter below. "
-                + ("**Classification:** predicts a label/class." if task == "classification"
-                   else "**Regression:** predicts a numeric value.")
-            )
-
-            if task == "classification":
-                st.caption(f"Binary threshold used (if binary): **{threshold:.2f}**")
-
-            meta = p.get("feature_meta", {}) or {}
-            vals: Dict[str, Any] = {}
-            cols2 = st.columns(2)
-
-            for i, f in enumerate(features):
-                with cols2[i % 2]:
-                    fmeta = meta.get(f, {"type": "numeric"})
-                    if fmeta.get("type") == "categorical":
-                        options = fmeta.get("options") or []
-                        vals[f] = st.selectbox(f, options=options, index=0) if options else st.text_input(f, value="")
-                    else:
-                        vals[f] = st.number_input(f, value=0.0, format="%.6f")
-
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            st.write("")
-            st.markdown('<div class="btn-row btn-emerald">', unsafe_allow_html=True)
-            do = st.button("🔮 Predict", use_container_width=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            if do:
-                row = pd.DataFrame([vals], columns=features)
-                pred, conf = predict_from_df(row, model, preprocessor, task=task, label_encoder=label_encoder, threshold=threshold)
-
-                st.write("")
-                st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-                st.write("### Prediction Result")
-
-                a, b, c = st.columns([1.2, 1.0, 1.2], gap="large")
-                with a:
-                    st.caption("Target")
-                    st.markdown(f"**{target_name}**")
-                with b:
-                    st.caption("Output Type")
-                    st.markdown(f"**{'Classification' if task == 'classification' else 'Regression'}**")
-                with c:
-                    st.caption("Model")
-                    st.markdown("**ANN**")
-
-                st.write("")
-                if task == "classification":
-                    pred_label = str(pred[0])
-                    conf_pct = f"{float(conf[0]) * 100:.1f}%" if conf is not None else "—"
-                    c1, c2 = st.columns(2, gap="large")
-                    with c1:
-                        st.metric(label=f"Predicted {target_name}", value=pred_label)
-                    with c2:
-                        st.metric(label="Confidence", value=conf_pct)
-                    st.caption("Confidence is the model’s estimated certainty for the predicted label.")
-                else:
-                    st.metric(label=f"Predicted {target_name}", value=f"{float(pred[0]):.6f}")
-                    st.caption("This numeric value is estimated by the trained model using your input features.")
-
-                st.markdown("</div>", unsafe_allow_html=True)
-
-        with tab2:
-            st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-            up = st.file_uploader("Upload CSV or Excel for batch predictions", type=["csv", "xlsx", "xls"], key="pred_upload")
-            st.caption("File must include the same feature columns.")
-            sheet = None
-            df_up = None
-
-            if up is not None:
-                try:
-                    if up.name.lower().endswith(".csv"):
-                        df_up = pd.read_csv(up)
-                    else:
-                        xls = pd.ExcelFile(up)
-                        sheet = st.selectbox("Select sheet", xls.sheet_names, index=0, key="pred_sheet")
-                        df_up = pd.read_excel(up, sheet_name=sheet)
-                except Exception as e:
-                    st.error(f"Could not read uploaded prediction file: {e}")
-
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            if df_up is not None:
-                missing_cols = [c for c in features if c not in df_up.columns]
-                if missing_cols:
-                    st.error(f"Missing required columns: {missing_cols}")
-                else:
-                    st.markdown('<div class="btn-row btn-emerald">', unsafe_allow_html=True)
-                    gen = st.button("Generate Predictions", use_container_width=True)
-                    st.markdown("</div>", unsafe_allow_html=True)
-
-                    if gen:
-                        X_feat = df_up[features].copy()
-                        preds, conf = predict_from_df(X_feat, model, preprocessor, task=task, label_encoder=label_encoder, threshold=threshold)
-
-                        out = df_up.copy()
-                        out[f"prediction__{target_name}"] = preds
-                        if task == "classification" and conf is not None:
-                            out["confidence"] = np.round(conf.astype(float), 6)
-
-                        st.success("Predictions generated (REAL).")
-                        st.dataframe(out.head(20), use_container_width=True)
-
-                        csv_bytes = out.to_csv(index=False).encode("utf-8")
-                        st.download_button("Download Results", data=csv_bytes, file_name="predictions.csv", mime="text/csv")
-
+    if source == "Upload new data for prediction":
+        new_file = st.file_uploader("Upload new prediction dataset", type=["csv", "xlsx", "xls"], key="pred_uploader")
+        if new_file is not None:
+            try:
+                pred_df = read_uploaded_data(new_file)
+            except Exception as e:
+                st.error(f"Prediction file load failed: {e}")
+                return
     else:
-        # LSTM: regression forecast OR classification next-step label
+        raw_df = st.session_state.get("raw_df")
+        pred_df = raw_df.copy() if raw_df is not None else None
+
+    if pred_df is None:
+        st.info("Provide a source dataset for prediction.")
+        return
+
+    if st.button("Run Forecast", type="primary"):
         try:
-            model, pack, outputs = cached_load_lstm_artifacts(
-                artifacts["model_path"],
-                artifacts["pack_path"],
-                artifacts["outputs_path"],
-            )
+            X_input, numeric = prepare_prediction_input(pred_df, processed, cfg)
+            pred_flat = training["model"].predict(X_input, verbose=0)
+            pred_inv = inverse_3d(pred_flat, processed["target_scaler"], int(cfg["horizon"]), len(processed["target_cols"]))[0]
+            pred_table = pd.DataFrame(pred_inv, columns=processed["target_cols"], index=[f"step_{i+1}" for i in range(int(cfg["horizon"]))])
+
+            implied_prices = None
+            if cfg["transform_mode"] in {"pct_change", "log_return", "raw"}:
+                last_prices = numeric.iloc[-1]
+                implied_prices = implied_prices_from_returns(last_prices, pred_inv, cfg["transform_mode"], processed["target_cols"])
+
+            st.session_state["prediction"] = {
+                "forecast_table": pred_table,
+                "implied_prices": implied_prices,
+            }
+            st.success("Forecast complete.")
         except Exception as e:
-            st.error(f"Failed to load LSTM artifacts: {e}")
-            return
+            st.error(f"Prediction failed: {e}")
 
-        lstm_task = (p.get("evaluation_metrics") or {}).get("task", "regression")
+    pred_state = st.session_state.get("prediction")
+    if pred_state is None:
+        return
 
-        if lstm_task == "classification":
-            st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-            st.write("### Next-step Classification (LSTM)")
-            st.caption("Predicts the target label at the selected horizon using the last lookback window.")
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            st.markdown('<div class="btn-row btn-emerald">', unsafe_allow_html=True)
-            do_cls = st.button("🔮 Predict Next Label", use_container_width=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            if do_cls:
-                try:
-                    label, conf = lstm_predict_next_class(model, outputs, pack)
-                    target_name = (p.get("columns") or {}).get("target") or "target"
-                    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-                    st.write("### Prediction Result")
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Model", "LSTM")
-                    c2.metric("Target", target_name)
-                    c3.metric("Type", "Classification")
-                    st.metric(f"Predicted {target_name}", label)
-                    st.metric("Confidence", f"{conf * 100:.1f}%")
-                    st.caption("Confidence is derived from predicted probability (binary) or max-softmax (multi-class).")
-                    st.markdown("</div>", unsafe_allow_html=True)
-                except Exception as e:
-                    st.error(f"Prediction error: {e}")
-
-        else:
-            # Regression forecast UI
-            KEY_FC_STEPS = f"fc_steps__{p['id']}"
-            KEY_FC_SHOW = f"fc_show__{p['id']}"
-            KEY_FC_DF = f"fc_df__{p['id']}"
-
-            st.session_state.setdefault(KEY_FC_STEPS, 1)
-            st.session_state.setdefault(KEY_FC_SHOW, 1)
-
-            def _generate_forecast(n_steps: int) -> pd.DataFrame:
-                scaled_full = outputs["scaled_full"]
-                lookback = int(artifacts.get("lookback", int(outputs["lookback"][0]) if "lookback" in outputs else 10))
-                last_feat = outputs["last_feature_scaled"]
-                scaler_y = pack["scaler_y"]
-
-                future = forecast_future_multivariate(
-                    model=model,
-                    scaler_y=scaler_y,
-                    scaled_full=scaled_full,
-                    lookback=lookback,
-                    n_steps=int(n_steps),
-                    last_feature_scaled=last_feat,
-                )
-                return pd.DataFrame(future, columns=["forecast"])
-
-            st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-            st.write("### Future Forecast (LSTM Regression)")
-            st.caption("If future feature values are unknown, the app holds features constant at the last observed values.")
-            st.number_input("Number of future steps to forecast", min_value=1, step=1, key=KEY_FC_STEPS)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            st.markdown('<div class="btn-row btn-emerald">', unsafe_allow_html=True)
-            do = st.button("🔮 Forecast", use_container_width=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            if do:
-                try:
-                    n_steps = int(st.session_state[KEY_FC_STEPS])
-                    df_fc = _generate_forecast(n_steps)
-                    if df_fc.empty:
-                        st.error("Forecast generated no results. Try increasing data or adjusting lookback/horizon.")
-                    else:
-                        st.session_state[KEY_FC_DF] = df_fc
-                        st.session_state[KEY_FC_SHOW] = max(1, min(int(st.session_state[KEY_FC_SHOW]), int(len(df_fc))))
-                except Exception as e:
-                    st.error(f"Forecast error: {e}")
-
-            df_fc: Optional[pd.DataFrame] = st.session_state.get(KEY_FC_DF, None)
-
-            if df_fc is not None and not df_fc.empty:
-                target_name = (p.get("columns") or {}).get("target") or "target"
-
-                st.write("")
-                st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-                st.write("### Forecast Result")
-
-                a, b, c = st.columns([1.2, 1.0, 1.2], gap="large")
-                with a:
-                    st.caption("Target")
-                    st.markdown(f"**{target_name}**")
-                with b:
-                    st.caption("Steps Generated")
-                    st.markdown(f"**{len(df_fc)}**")
-                with c:
-                    st.caption("Model")
-                    st.markdown("**LSTM (Regression)**")
-
-                first_val = float(df_fc["forecast"].iloc[0])
-                st.metric(label=f"Forecasted {target_name} (next step)", value=f"{first_val:,.4f}")
-
-                st.write("")
-                st.number_input("Number of forecast steps shown", min_value=1, step=1, key=KEY_FC_SHOW)
-                want_show = int(st.session_state[KEY_FC_SHOW])
-
-                if want_show > len(df_fc):
-                    try:
-                        df_new = _generate_forecast(want_show)
-                        if not df_new.empty:
-                            st.session_state[KEY_FC_DF] = df_new
-                            df_fc = df_new
-                    except Exception as e:
-                        st.warning(f"Could not auto-expand forecast: {e}")
-                        want_show = len(df_fc)
-
-                show_n = max(1, min(want_show, int(len(df_fc))))
-                preview_df = df_fc.head(show_n).copy()
-                preview_df.insert(0, "step", range(1, len(preview_df) + 1))
-                st.dataframe(preview_df, use_container_width=True, height=320)
-
-                csv_bytes = df_fc.to_csv(index=False).encode("utf-8")
-                st.download_button("Download Forecast CSV", data=csv_bytes, file_name="lstm_forecast.csv", mime="text/csv")
-
-                st.caption("These values are generated from the trained LSTM model based on your historical data.")
-                st.markdown("</div>", unsafe_allow_html=True)
-
-    st.write("")
-    c1, c2 = st.columns(2, gap="large")
-    with c1:
-        st.markdown('<div class="btn-row">', unsafe_allow_html=True)
-        st.button("⬅ Back to Evaluate", use_container_width=True, on_click=request_nav, args=("evaluate",))
-        st.markdown("</div>", unsafe_allow_html=True)
-    with c2:
-        st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
-        st.button("Continue to Visualize ➜", use_container_width=True, on_click=request_nav, args=("visualize",))
-        st.markdown("</div>", unsafe_allow_html=True)
+    st.write("**Forecast in modeled units**")
+    st.dataframe(pred_state["forecast_table"], use_container_width=True)
+    if pred_state["implied_prices"] is not None:
+        st.write("**Implied future prices**")
+        st.dataframe(pred_state["implied_prices"], use_container_width=True)
 
 
 def page_visualize():
-    p = ensure_current_project()
-    if p is None:
-        st.warning("No current project.")
+    hero("Visualize", "All the plots you actually need, not decorative nonsense.")
+    training = st.session_state.get("training")
+    processed = st.session_state.get("processed")
+    if training is None or processed is None:
+        st.info("Train the model first.")
         return
 
-    st.title("Visualize")
-    status_bar(p.get("status", "data_loaded"))
-    plt = _get_plt()
-    _apply_plot_style(plt)
+    cfg = st.session_state["config"]
 
-    ds = p.get("dataset", {})
-    target = (p.get("columns") or {}).get("target")
-    metrics = p.get("evaluation_metrics") or {}
-    task = metrics.get("task", p.get("task_type", "classification"))
-    kind = (p.get("artifacts") or {}).get("kind", "ann")
-
-    # ------------------------------
-    # Target Preview
-    # ------------------------------
-    st.write("")
-    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-    st.write("### Target Preview")
-
-    if ds.get("path") and target:
-        try:
-            df = load_project_dataset(p)
-            if target not in df.columns:
-                st.info("Target column not found in the dataset.")
-            else:
-                y = df[target].copy()
-                y_num = pd.to_numeric(y, errors="coerce")
-
-                if y_num.notna().sum() >= 5:
-                    y_plot = y_num.dropna().head(400)
-                    fig0 = plt.figure(figsize=(12.5, 4.4))
-                    ax = fig0.gca()
-                    ax.plot(range(len(y_plot)), y_plot.values, linewidth=1.8)
-                    ax.set_title(f"Target Trend — {target} (first {len(y_plot)} points)")
-                    ax.set_xlabel("Index")
-                    ax.set_ylabel(target)
-                    ax.grid(True, alpha=0.22)
-                    fig0.tight_layout()
-                    st.pyplot(fig0, clear_figure=True)
-                    st.caption("Quick view of the target behavior (numeric conversion applied).")
-                else:
-                    vc = y.astype(str).value_counts().head(20)
-                    fig0 = plt.figure(figsize=(12.5, 4.4))
-                    ax = fig0.gca()
-                    ax.bar(vc.index.astype(str), vc.values)
-                    ax.set_title("Target Category Distribution (Top 20)")
-                    ax.set_xlabel("Class")
-                    ax.set_ylabel("Count")
-                    ax.tick_params(axis="x", rotation=30)
-                    ax.grid(True, axis="y", alpha=0.22)
-                    fig0.tight_layout()
-                    st.pyplot(fig0, clear_figure=True)
-                    st.caption("Target appears non-numeric; showing the most frequent classes.")
-        except Exception as e:
-            st.info(f"Preview plot unavailable: {e}")
+    st.subheader("Data and training overview")
+    ov1, ov2 = st.columns(2)
+    if isinstance(processed["dates"].iloc[0], pd.Timestamp):
+        frame = processed["transformed"][processed["target_cols"]].copy()
+        frame.index = processed["dates"]
+        with ov1:
+            st.pyplot(fig_line(frame, "Target Series After Transformation", ylabel="Modeled Value"), use_container_width=True)
     else:
-        st.info("Upload data and choose a target column to see the target preview.")
+        with ov1:
+            st.info("Date-based overview is only shown when a valid date column exists.")
+    with ov2:
+        st.pyplot(fig_training_history(training["history"]), use_container_width=True)
 
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.subheader("Prediction diagnostics")
+    split = st.selectbox("Visualization split", ["train", "val", "test"], index=2)
+    target = st.selectbox("Visualization target", processed["target_cols"], index=0)
+    horizon_step = st.selectbox("Visualization horizon step", list(range(1, int(cfg["horizon"]) + 1)), index=0)
 
-    # ------------------------------
-    # Training Curve
-    # ------------------------------
-    # ------------------------------
-    # Training Curve
-    # ------------------------------
-    loss = (p.get("history") or {}).get("loss", []) or []
-    val_loss = (p.get("history") or {}).get("val_loss", []) or []
+    idx = processed["target_cols"].index(target)
+    h = horizon_step - 1
+    actual = training["actuals"][split][:, h, idx]
+    pred = training["predictions"][split][:, h, idx]
+    residuals = actual - pred
 
-    st.write("")
-    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-    st.write("### Training Curve (Loss)")
+    a, b = st.columns(2)
+    with a:
+        st.pyplot(fig_actual_vs_predicted(actual, pred, f"{split.title()} | {target} | Overlay"), use_container_width=True)
+    with b:
+        st.pyplot(fig_scatter(actual, pred, f"{split.title()} | {target} | Scatter"), use_container_width=True)
 
-    if loss:
-        fig = plt.figure(figsize=(12.8, 4.4))
-        ax = fig.gca()
+    c, d = st.columns(2)
+    with c:
+        st.pyplot(fig_residuals_vs_pred(pred, residuals, f"{split.title()} | {target} | Residuals vs Predicted"), use_container_width=True)
+    with d:
+        st.pyplot(fig_rolling_rmse(actual, pred, f"{split.title()} | {target} | Rolling RMSE", window=max(10, int(cfg['lookback']))), use_container_width=True)
 
-        x = np.arange(1, len(loss) + 1)
-        ax.plot(x, loss, label="Train Loss", linewidth=2.4)
+    e, f = st.columns(2)
+    with e:
+        st.pyplot(fig_distribution(actual, pred, f"{split.title()} | {target} | Distribution"), use_container_width=True)
+    with f:
+        st.pyplot(fig_qq(residuals, f"{split.title()} | {target} | QQ Plot"), use_container_width=True)
 
-        if val_loss:
-            xv = np.arange(1, len(val_loss) + 1)
-            ax.plot(xv, val_loss, label="Validation Loss", linewidth=2.4)
-
-            # Highlight best validation epoch (if available)
-            try:
-                best_i = int(np.argmin(np.array(val_loss, dtype=float))) + 1
-                best_v = float(val_loss[best_i - 1])
-                ax.axvline(best_i, linestyle=":", linewidth=1.6)
-                ax.text(best_i, best_v, f"  best val @ epoch {best_i}", va="bottom")
-            except Exception:
-                pass
-
-        ax.set_title("Loss vs Epoch (Training Progress)")
-        ax.set_xlabel("Epoch")
-        ax.set_ylabel("Loss (lower is better)")
-        ax.grid(True, alpha=0.22)
-        ax.legend(loc="best")
-
-        # Optional: show target epochs configured (helps user understand “why stopped”)
-        try:
-            planned = int((p.get("train_config") or {}).get("epochs", 0))
-            if planned > 0:
-                ax.set_xlim(1, max(len(loss), min(planned, 1000)))
-        except Exception:
-            pass
-
-        fig.tight_layout()
-        st.pyplot(fig, clear_figure=True)
-
-        # More useful caption
-        es_on = bool((p.get("train_config") or {}).get("early_stop", False))
-        if es_on:
-            st.caption(
-                "Early stopping is ON: training may stop before the planned epochs if validation loss stops improving.")
-        else:
-            st.caption("Early stopping is OFF: training runs for the full number of epochs you set.")
+    if cfg["transform_mode"] in {"pct_change", "log_return"} and int(cfg["horizon"]) >= 1:
+        st.subheader("Signal-driven strategy simulation (MATLAB-style idea, simplified)")
+        actual_step1 = training["actuals"]["test"][:, 0, :]
+        pred_step1 = training["predictions"]["test"][:, 0, :]
+        actual_ret = returns_for_backtest(cfg["transform_mode"], actual_step1)
+        pred_ret = returns_for_backtest(cfg["transform_mode"], pred_step1)
+        test_dates = np.array([pd.to_datetime(x[0]) for x in training["times"]["test"]])
+        equity_df, summary_df = backtest_strategies(actual_ret, pred_ret, test_dates, processed["target_cols"], processed["freq_name"])
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        st.pyplot(fig_equity_curves(equity_df, "Strategy Equity Curves"), use_container_width=True)
+        st.pyplot(fig_drawdowns(equity_df, "Strategy Drawdowns"), use_container_width=True)
     else:
-        st.info("No training history yet. Train the model first.")
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # ------------------------------
-    # ANN Visuals
-    # ------------------------------
-    if kind == "ann":
-        if task == "regression":
-            viz = (p.get("viz_cache") or {}).get("ann_regression")
-            if viz:
-                y_test = np.array(viz.get("y_test", []), dtype=float)
-                y_pred = np.array(viz.get("y_pred", []), dtype=float)
-                if len(y_test) and len(y_pred) and len(y_test) == len(y_pred):
-                    resid = y_test - y_pred
-
-                    st.write("")
-                    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-                    st.write("### Actual vs Predicted (ANN Regression)")
-                    fig_ap = plt.figure(figsize=(12.5, 5.0))
-                    ax = fig_ap.gca()
-                    ax.scatter(y_test, y_pred, alpha=0.65)
-                    mn = float(np.nanmin([np.nanmin(y_test), np.nanmin(y_pred)]))
-                    mx = float(np.nanmax([np.nanmax(y_test), np.nanmax(y_pred)]))
-                    ax.plot([mn, mx], [mn, mx], linewidth=2.0)
-                    ax.set_title("Actual vs Predicted")
-                    ax.set_xlabel("Actual")
-                    ax.set_ylabel("Predicted")
-                    ax.grid(True, alpha=0.22)
-                    fig_ap.tight_layout()
-                    st.pyplot(fig_ap, clear_figure=True)
-                    st.caption("Points close to the diagonal line (y=x) indicate strong regression performance.")
-                    st.markdown("</div>", unsafe_allow_html=True)
-
-                    st.write("")
-                    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-                    st.write("### Residuals vs Predicted (ANN Regression)")
-                    fig_r = plt.figure(figsize=(12.5, 4.6))
-                    ax2 = fig_r.gca()
-                    ax2.scatter(y_pred, resid, alpha=0.65)
-                    ax2.axhline(0.0, linestyle="--", linewidth=1.6)
-                    rstd = float(np.nanstd(resid)) if np.isfinite(resid).any() else 0.0
-                    if rstd > 0:
-                        ax2.axhline(+2 * rstd, linestyle=":", linewidth=1.2, alpha=0.7)
-                        ax2.axhline(-2 * rstd, linestyle=":", linewidth=1.2, alpha=0.7)
-                    ax2.set_title("Residuals vs Predicted")
-                    ax2.set_xlabel("Predicted")
-                    ax2.set_ylabel("Residual (Actual − Predicted)")
-                    ax2.grid(True, alpha=0.22)
-                    fig_r.tight_layout()
-                    st.pyplot(fig_r, clear_figure=True)
-                    st.caption("Good models show residuals randomly scattered around 0 (no strong pattern).")
-                    st.markdown("</div>", unsafe_allow_html=True)
-
-                    st.write("")
-                    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-                    st.write("### Residual Distribution (ANN Regression)")
-                    fig_h = plt.figure(figsize=(12.5, 4.6))
-                    ax3 = fig_h.gca()
-                    ax3.hist(resid[np.isfinite(resid)], bins=30, alpha=0.9)
-                    ax3.axvline(0.0, linestyle="--", linewidth=1.6)
-                    ax3.set_title("Residual Histogram")
-                    ax3.set_xlabel("Residual (Actual − Predicted)")
-                    ax3.set_ylabel("Count")
-                    ax3.grid(True, axis="y", alpha=0.22)
-                    fig_h.tight_layout()
-                    st.pyplot(fig_h, clear_figure=True)
-                    st.caption("A tighter distribution centered near 0 often indicates better fit.")
-                    st.markdown("</div>", unsafe_allow_html=True)
-        else:
-            # ANN classification
-            st.write("")
-            st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-            st.write("### Classification Diagnostics (ANN)")
-
-
-            cm = np.array(metrics.get("confusion_matrix", [[0, 0], [0, 0]]), dtype=int)
-            labels = metrics.get("class_labels") or None
-            fig_cm = _plot_confusion_matrix(plt, cm, labels, title="Confusion Matrix (ANN)")
-
-            left, right = st.columns([2.1, 1.4])
-
-            with left:
-                st.pyplot(fig_cm, clear_figure=True)
-
-            with right:
-                st.write("### Metrics")
-                st.write(f"- Accuracy: {float(metrics.get('accuracy', 0)) * 100:.1f}%")
-                st.write(f"- Precision: {float(metrics.get('precision', 0)) * 100:.1f}%")
-                st.write(f"- Recall: {float(metrics.get('recall', 0)) * 100:.1f}%")
-                st.write(f"- F1: {float(metrics.get('f1_score', 0)) * 100:.1f}%")
-
-            # ROC/PR + threshold (binary only)
-            y_true = metrics.get("y_true", None)
-            y_score = metrics.get("y_score", None)
-            if y_true is not None and y_score is not None:
-                try:
-                    fig_roc, fig_pr, fig_thr = _plot_roc_pr_threshold(plt, np.array(y_true), np.array(y_score))
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.pyplot(fig_roc, clear_figure=True)
-                    with c2:
-                        st.pyplot(fig_pr, clear_figure=True)
-                    st.pyplot(fig_thr, clear_figure=True)
-                    st.caption("Binary ANN: ROC/PR curves and threshold analysis are shown (GitHub/research standard).")
-                except Exception as e:
-                    st.info(f"ROC/PR plots not available: {e}")
-            else:
-                st.caption("ROC/PR/Threshold plots are shown only for binary classification.")
-            st.markdown("</div>", unsafe_allow_html=True)
-
-    # ------------------------------
-    # LSTM Visuals
-    # ------------------------------
-    if kind == "lstm":
-        st.write("")
-        st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-        st.write("### LSTM Visual Diagnostics")
-
-        try:
-            _, pack, outputs = cached_load_lstm_artifacts(
-                (p.get("artifacts") or {})["model_path"],
-                (p.get("artifacts") or {})["pack_path"],
-                (p.get("artifacts") or {})["outputs_path"],
-            )
-            lstm_task = (p.get("evaluation_metrics") or {}).get("task", "regression")
-
-            if lstm_task == "regression":
-                y_train_actual = outputs["y_train_actual"].reshape(-1)
-                y_test_actual = outputs["y_test_actual"].reshape(-1)
-                train_pred_actual = outputs["train_pred_actual"].reshape(-1)
-                test_pred_actual = outputs["test_pred_actual"].reshape(-1)
-                lookback = int((p.get("artifacts") or {}).get("lookback", int(outputs["lookback"][0]) if "lookback" in outputs else 10))
-
-                fig2 = plt.figure(figsize=(12.5, 5.0))
-                ax = fig2.gca()
-                train_idx = range(lookback, lookback + len(y_train_actual))
-                split_x = lookback + len(y_train_actual)
-                test_idx = range(split_x, split_x + len(y_test_actual))
-
-                ax.plot(train_idx, y_train_actual, label="Actual (Train)", alpha=0.65, linewidth=1.8)
-                ax.plot(train_idx, train_pred_actual, label="Predicted (Train)", alpha=0.65, linestyle="--", linewidth=1.8)
-                ax.plot(test_idx, y_test_actual, label="Actual (Test)", alpha=0.90, linewidth=2.2)
-                ax.plot(test_idx, test_pred_actual, label="Predicted (Test)", alpha=0.90, linestyle="--", linewidth=2.2)
-                ax.axvline(x=split_x, linestyle=":", linewidth=1.6, label="Train/Test Split")
-
-                ax.set_title("LSTM Regression: Actual vs Predicted (Train/Test)")
-                ax.set_xlabel("Time Index")
-                ax.set_ylabel("Target Value")
-                ax.grid(True, alpha=0.22)
-                ax.legend(loc="best")
-                fig2.tight_layout()
-                st.pyplot(fig2, clear_figure=True)
-
-                # Residuals (test)
-                resid_l = y_test_actual - test_pred_actual
-                fig_rl = plt.figure(figsize=(12.5, 4.6))
-                ax2 = fig_rl.gca()
-                ax2.scatter(test_pred_actual, resid_l, alpha=0.65)
-                ax2.axhline(0.0, linestyle="--", linewidth=1.6)
-                rstd = float(np.nanstd(resid_l)) if np.isfinite(resid_l).any() else 0.0
-                if rstd > 0:
-                    ax2.axhline(+2 * rstd, linestyle=":", linewidth=1.2, alpha=0.7)
-                    ax2.axhline(-2 * rstd, linestyle=":", linewidth=1.2, alpha=0.7)
-                ax2.set_title("LSTM Regression: Residuals vs Predicted (Test)")
-                ax2.set_xlabel("Predicted")
-                ax2.set_ylabel("Residual (Actual − Predicted)")
-                ax2.grid(True, alpha=0.22)
-                fig_rl.tight_layout()
-                st.pyplot(fig_rl, clear_figure=True)
-            else:
-                # LSTM classification plots
-                y_true = outputs.get("y_test_cls", None)
-                y_pred = outputs.get("y_pred_cls", None)
-                if y_true is not None and y_pred is not None:
-                    y_true = np.array(y_true, dtype=int).reshape(-1)
-                    y_pred = np.array(y_pred, dtype=int).reshape(-1)
-                    sk = _get_sklearn()
-                    cm = sk["confusion_matrix"](y_true, y_pred)
-                    labels = (p.get("evaluation_metrics") or {}).get("class_labels") or None
-                    fig_cm = _plot_confusion_matrix(plt, cm, labels, title="Confusion Matrix (LSTM)")
-                    st.pyplot(fig_cm, clear_figure=True)
-
-                    # Binary ROC/PR if available
-                    y_score = outputs.get("y_score_cls", None)
-                    if y_score is not None:
-                        try:
-                            fig_roc, fig_pr, fig_thr = _plot_roc_pr_threshold(plt, y_true, np.array(y_score, dtype=float))
-                            c1, c2 = st.columns(2)
-                            with c1:
-                                st.pyplot(fig_roc, clear_figure=True)
-                            with c2:
-                                st.pyplot(fig_pr, clear_figure=True)
-                            st.pyplot(fig_thr, clear_figure=True)
-                        except Exception as e:
-                            st.info(f"ROC/PR plots not available: {e}")
-                    st.caption("LSTM classification diagnostics. Binary ROC/PR shown if the task is binary.")
-                else:
-                    st.info("LSTM classification visualization not available (missing saved arrays).")
-        except Exception as e:
-            st.info(f"LSTM plots not available: {e}")
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    # ------------------------------
-    # Evaluation Summary (clean)
-    # ------------------------------
-    st.write("")
-    st.markdown('<div class="ns-card" style="border-color:#a7f3d0; background:#ecfdf5;">', unsafe_allow_html=True)
-    st.write("### Evaluation Summary")
-
-    m = p.get("evaluation_metrics") or {}
-    if not m:
-        st.caption("No evaluation metrics yet.")
-    else:
-        task2 = m.get("task", "—")
-        model2 = (p.get("model_type") or "—").upper()
-        target_name = (p.get("columns") or {}).get("target") or "target"
-
-        top1, top2, top3 = st.columns(3)
-        top1.metric("Model", model2)
-        top2.metric("Task", str(task2).title())
-        top3.metric("Target", target_name)
-
-        if task2 == "classification":
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Accuracy", f"{float(m.get('accuracy', 0.0)) * 100:.1f}%")
-            c2.metric("Precision", f"{float(m.get('precision', 0.0)) * 100:.1f}%")
-            c3.metric("Recall", f"{float(m.get('recall', 0.0)) * 100:.1f}%")
-            c4.metric("F1", f"{float(m.get('f1_score', 0.0)) * 100:.1f}%")
-        else:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("MAE", f"{float(m.get('mae', 0.0)):.4f}")
-            c2.metric("RMSE", f"{float(m.get('rmse', 0.0)):.4f}")
-            c3.metric("R²", f"{float(m.get('r2_score', 0.0)):.4f}")
-
-        with st.expander("Show full metrics JSON"):
-            st.json(m)
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.write("")
-    c1, c2 = st.columns(2, gap="large")
-    with c1:
-        st.markdown('<div class="btn-row">', unsafe_allow_html=True)
-        st.button("⬅ Back to Predict", use_container_width=True, on_click=request_nav, args=("predict",))
-        st.markdown("</div>", unsafe_allow_html=True)
-    with c2:
-        st.markdown('<div class="btn-row btn-grad">', unsafe_allow_html=True)
-        st.button("Continue to Save / Load ➜", use_container_width=True, on_click=request_nav, args=("save",))
-        st.markdown("</div>", unsafe_allow_html=True)
+        st.info("Backtest-style strategy plots are only shown when the modeled targets are returns or log returns.")
 
 
 def page_save_load():
-    p = ensure_current_project()
-    if p is None:
-        st.warning("No current project.")
-        return
+    hero("Save / Load", "Persist the full project so you do not have to rebuild everything from scratch every time.")
 
-    st.title("Save / Load")
-    status_bar(p.get("status", "data_loaded"))
-
-    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-    st.write("### Current Model Info")
-    st.write(f"**Project:** {p.get('name')}")
-    st.write(f"**Model:** {p.get('model_type', '—').upper()} • **Task:** {(p.get('evaluation_metrics') or {}).get('task', p.get('task_type', '—'))}")
-    st.write(f"**Status:** {p.get('status', '—')}")
-    st.write("**Features:** " + ", ".join(p.get("columns", {}).get("features", [])[:12]) + (" ..." if len(p.get("columns", {}).get("features", [])) > 12 else ""))
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.write("")
-    st.markdown('<div class="ns-card" style="border-color:#a7f3d0;">', unsafe_allow_html=True)
-    st.write("### Save Project Package (JSON)")
-    st.caption("Saves UI settings + history + paths. (Model files are stored under .neural_studio/models/)")
-    json_bytes = json.dumps(_json_safe(p), indent=2, ensure_ascii=False).encode("utf-8")
-    st.download_button("💾 Download JSON", data=json_bytes, file_name="neural_studio_project.json", mime="application/json")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.write("")
-    st.markdown('<div class="ns-card" style="border-color:#c7d2fe;">', unsafe_allow_html=True)
-    st.write("### Load Project Package (JSON)")
-    up = st.file_uploader("Upload saved JSON", type=["json"])
-    if up is not None:
-        try:
-            loaded = json.loads(up.read().decode("utf-8"))
-            if "id" not in loaded:
-                loaded["id"] = str(uuid.uuid4())
-            loaded.setdefault("columns", {"target": None, "time": None, "features": []})
-            loaded.setdefault("dataset", {"filename": "—", "rows": 0, "cols": 0, "missing": 0, "path": None, "file_type": None, "sheet": None})
-            loaded.setdefault("preprocess", {"split": 0.8, "seed": 42, "lookback": 20, "horizon": 1, "missing_strategy": "Drop rows"})
-            loaded.setdefault("train_config", {"epochs": 20, "batch_size": 32, "lr": 0.001, "early_stop": True, "patience": 5})
-            loaded.setdefault("ann_config", {"hidden_layers": 3, "neurons": [256, 128, 64], "activation": "ReLU", "output_activation": "Auto"})
-            loaded.setdefault("lstm_config", {"units": 64, "layers": 2, "dropout": 0.2, "bidirectional": False})
-            loaded.setdefault("viz_cache", {})
-            loaded.setdefault("target_profile", {})
-            loaded.setdefault("ann_threshold", 0.5)
-            upsert_project(loaded)
-            request_nav("data")
-        except Exception as e:
-            st.error(f"Failed to load JSON: {e}")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.write("")
-    st.markdown('<div class="btn-row">', unsafe_allow_html=True)
-    st.button("⬅ Back to Visualize", use_container_width=True, on_click=request_nav, args=("visualize",))
-    st.markdown("</div>", unsafe_allow_html=True)
-
-def page_cnn():
-    st.title("CNN")
-    st.caption("CNN interface")
-    c1, c2 = st.columns([1, 6])
+    c1, c2 = st.columns(2)
     with c1:
-        st.button("⬅ Back", on_click=goto, args=("model",))
-
-    # CNN page-local style
-    st.markdown("""
-    <style>
-    .cnn-section-card {
-        padding: 16px 18px;
-        border-radius: 12px;
-        border: 1px solid rgba(0,0,0,0.08);
-        background: #ffffff;
-        margin-bottom: 16px;
-    }
-    .cnn-info-card {
-        padding: 14px 16px;
-        border-radius: 12px;
-        border: 1px solid rgba(0,0,0,0.08);
-        background: #f8fafc;
-    }
-    .cnn-section-title {
-        font-size: 24px;
-        font-weight: 700;
-        margin-top: 10px;
-        margin-bottom: 8px;
-        color: #1f2937;
-    }
-    .cnn-subtle {
-        color: #667085;
-        font-size: 13px;
-        line-height: 1.5;
-    }
-    .cnn-result-card {
-        padding: 12px 14px;
-        border-radius: 12px;
-        border: 1px solid rgba(0,0,0,0.07);
-        background: #ffffff;
-        text-align: center;
-        margin-bottom: 12px;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-    plt = _get_plt()
-    _apply_plot_style(plt)
-
-    tf = _get_tf()
-    from tensorflow.keras import layers, models
-    from tensorflow.keras.datasets import mnist
-    from scipy.ndimage import rotate
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import mean_squared_error
-    from PIL import Image
-
-    # -------------------------
-    # Local helpers for CNN page
-    # -------------------------
-    def moving_average(x, w=25):
-        x = np.asarray(x, dtype=float)
-        if len(x) == 0:
-            return x
-        if w <= 1 or len(x) < w:
-            return x
-        return np.convolve(x, np.ones(w) / w, mode="same")
-
-    class MatlabProgress(tf.keras.callbacks.Callback):
-        def __init__(self, val_data, val_freq_iters: int):
-            super().__init__()
-            self.xv, self.yv = val_data
-            self.val_freq_iters = max(1, int(val_freq_iters))
-
-            self.iters = []
-            self.train_loss = []
-            self.train_rmse = []
-
-            self.val_iters = []
-            self.val_loss = []
-            self.val_rmse = []
-
-        def on_train_batch_end(self, batch, logs=None):
-            logs = logs or {}
-            i = len(self.train_loss) + 1
-
-            self.iters.append(i)
-            self.train_loss.append(float(logs.get("loss", np.nan)))
-            self.train_rmse.append(float(logs.get("root_mean_squared_error", np.nan)))
-
-            if i % self.val_freq_iters == 0:
-                v = self.model.evaluate(self.xv, self.yv, verbose=0, return_dict=True)
-                self.val_iters.append(i)
-                self.val_loss.append(float(v.get("loss", np.nan)))
-                self.val_rmse.append(float(v.get("root_mean_squared_error", np.nan)))
-
-    @st.cache_resource(show_spinner=False)
-    def prepare_data(seed: int = 42, n_train: int = 5000, n_test: int = 5000):
-        (x_train, _), (x_test, _) = mnist.load_data()
-
-        x_train = x_train[:n_train].astype("float32") / 255.0
-        x_test = x_test[:n_test].astype("float32") / 255.0
-
-        x_train = np.expand_dims(x_train, -1)
-        x_test = np.expand_dims(x_test, -1)
-
-        rng = np.random.default_rng(seed)
-
-        def rotate_set(images):
-            imgs, angles = [], []
-            for img in images:
-                angle = float(rng.uniform(-45, 45))
-                rotated = rotate(
-                    img.squeeze(),
-                    angle,
-                    reshape=False,
-                    order=1,
-                    mode="constant",
-                    cval=0.0
-                )
-                imgs.append(np.expand_dims(rotated, -1))
-                angles.append(angle)
-            return np.array(imgs, dtype="float32"), np.array(angles, dtype="float32")
-
-        x_train_rot, y_train = rotate_set(x_train)
-        x_test_rot, y_test = rotate_set(x_test)
-
-        x_train_rot, x_val, y_train, y_val = train_test_split(
-            x_train_rot, y_train, test_size=0.15, random_state=seed
-        )
-
-        return x_train_rot, y_train, x_val, y_val, x_test_rot, y_test
-
-    def build_model():
-        model = models.Sequential([
-            layers.Input(shape=(28, 28, 1)),
-
-            layers.Conv2D(8, 3, padding="same"),
-            layers.BatchNormalization(),
-            layers.ReLU(),
-            layers.AveragePooling2D(2, strides=2),
-
-            layers.Conv2D(16, 3, padding="same"),
-            layers.BatchNormalization(),
-            layers.ReLU(),
-            layers.AveragePooling2D(2, strides=2),
-
-            layers.Conv2D(32, 3, padding="same"),
-            layers.BatchNormalization(),
-            layers.ReLU(),
-
-            layers.Conv2D(32, 3, padding="same"),
-            layers.BatchNormalization(),
-            layers.ReLU(),
-
-            layers.Flatten(),
-            layers.Dense(1)
-        ])
-
-        optimizer = tf.keras.optimizers.SGD(
-            learning_rate=1e-3,
-            momentum=0.9
-        )
-
-        model.compile(
-            optimizer=optimizer,
-            loss="mse",
-            metrics=[tf.keras.metrics.RootMeanSquaredError()]
-        )
-        return model
-
-    def lr_schedule(epoch, lr):
-        return 1e-3 if epoch < 20 else 1e-4
-
-    # -------------------------
-    # CNN session keys
-    # -------------------------
-    if "cnn_uploaded_prediction_files" not in st.session_state:
-        st.session_state.cnn_uploaded_prediction_files = []
-
-    if "cnn_training_done" not in st.session_state:
-        st.session_state.cnn_training_done = False
-
-    # -------------------------
-    # CNN UI
-    # -------------------------
-    st.markdown("<div class='cnn-section-title'>1. Upload Images</div>", unsafe_allow_html=True)
-    st.markdown(
-        "<div class='cnn-subtle'>Upload one or more images first. Prediction will appear after training.</div>",
-        unsafe_allow_html=True
-    )
-
-    uploaded_files = st.file_uploader(
-        "Select image files",
-        type=["png", "jpg", "jpeg"],
-        accept_multiple_files=True,
-        key="cnn_prediction_uploader"
-    )
-
-    if uploaded_files:
-        st.session_state.cnn_uploaded_prediction_files = uploaded_files
-
-    saved_files = st.session_state.cnn_uploaded_prediction_files
-
-    if saved_files:
-        st.markdown("<div class='cnn-section-card'>", unsafe_allow_html=True)
-        st.markdown("#### Uploaded Image Preview")
-        preview_cols = st.columns(5)
-
-        for idx, file in enumerate(saved_files):
+        st.subheader("Save current project")
+        if st.session_state.get("training") is None:
+            st.info("Train a model before saving.")
+        else:
             try:
-                file.seek(0)
-            except Exception:
-                pass
-            img = Image.open(file).convert("L").resize((28, 28))
-            preview_cols[idx % 5].image(img, caption=file.name, width=120)
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<div class='cnn-section-title'>2. Training Configuration</div>", unsafe_allow_html=True)
-
-    st.markdown("<div class='cnn-section-card'>", unsafe_allow_html=True)
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        seed = st.number_input("Random Seed", min_value=0, max_value=999999, value=42, step=1, key="cnn_seed")
-        n_train = st.selectbox("Training Samples", [2000, 5000, 8000], index=1, key="cnn_n_train")
+                bundle_bytes = make_bundle_bytes()
+                file_name = f"{st.session_state['config']['project_name']}.zip"
+                st.download_button(
+                    "Download project bundle",
+                    data=bundle_bytes,
+                    file_name=file_name,
+                    mime="application/zip",
+                )
+                if st.button("Write a local copy", key="write_local_bundle"):
+                    local_path = PROJECTS_DIR / file_name
+                    with open(local_path, "wb") as f:
+                        f.write(bundle_bytes)
+                    st.success(f"Local copy saved to: {local_path}")
+            except Exception as e:
+                st.error(f"Save failed: {e}")
 
     with c2:
-        n_test = st.selectbox("Test Samples", [1000, 5000], index=1, key="cnn_n_test")
-        epochs = st.slider("Epochs", 5, 60, 30, 1, key="cnn_epochs")
+        st.subheader("Load existing project")
+        uploaded_zip = st.file_uploader("Upload saved project zip", type=["zip"], key="bundle_loader")
+        if uploaded_zip is not None:
+            try:
+                load_bundle(uploaded_zip)
+                st.success("Project loaded.")
+            except Exception as e:
+                st.error(f"Load failed: {e}")
 
-    with c3:
-        batch_size = st.selectbox("Batch Size", [32, 64, 128, 256], index=2, key="cnn_batch")
-        smooth_w = st.slider("Curve Smoothing", 1, 75, 25, 1, key="cnn_smooth")
+    existing = sorted(PROJECTS_DIR.glob("*.zip"))
+    if existing:
+        st.subheader("Local saved bundles")
+        st.dataframe(pd.DataFrame({"file": [p.name for p in existing], "path": [str(p) for p in existing]}), use_container_width=True, hide_index=True)
 
-    st.markdown(
-        "<div class='cnn-subtle'>Closest MATLAB settings: Seed 42, Training Samples 5000, Test Samples 5000, Epochs 30, Batch Size 128, Curve Smoothing 25.</div>",
-        unsafe_allow_html=True
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='cnn-section-title'>3. Train Model</div>", unsafe_allow_html=True)
+# -----------------------------
+# Workflow / project helpers
+# -----------------------------
+def _lstm_go(page_name: str):
+    st.session_state["page"] = page_name
 
-    left_col, right_col = st.columns([1.3, 0.95])
 
-    with left_col:
-        train_clicked = st.button("Start Training", type="primary", key="cnn_train_btn")
+def _lstm_reset_state(target_page: str):
+    preserved = {k: st.session_state[k] for k in list(st.session_state.keys()) if str(k).startswith("__unified_")}
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+    for k, v in preserved.items():
+        st.session_state[k] = v
+    init_state()
+    st.session_state["page"] = target_page
+    st.rerun()
 
-    
 
-    if train_clicked:
-        try:
-            with st.spinner("Preparing training data..."):
-                x_train, y_train, x_val, y_val, x_test, y_test = prepare_data(
-                    seed=int(seed),
-                    n_train=int(n_train),
-                    n_test=int(n_test)
-                )
-
-            val_freq_iters = max(1, len(y_train) // int(batch_size))
-
-            model = build_model()
-            lr_cb = tf.keras.callbacks.LearningRateScheduler(lr_schedule, verbose=0)
-            mp = MatlabProgress(val_data=(x_val, y_val), val_freq_iters=val_freq_iters)
-
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-
-            class StreamlitProgress(tf.keras.callbacks.Callback):
-                def on_epoch_end(self, epoch, logs=None):
-                    pct = int(((epoch + 1) / int(epochs)) * 100)
-                    progress_bar.progress(min(pct, 100))
-                    logs = logs or {}
-                    loss = logs.get("loss", np.nan)
-                    rmse = logs.get("root_mean_squared_error", np.nan)
-                    status_text.markdown(
-                        f"**Training progress:** Epoch {epoch + 1}/{int(epochs)} "
-                        f"&nbsp;&nbsp;|&nbsp;&nbsp; Loss: {loss:.4f} "
-                        f"&nbsp;&nbsp;|&nbsp;&nbsp; RMSE: {rmse:.4f}"
-                    )
-
-            with st.spinner("Training model..."):
-                model.fit(
-                    x_train, y_train,
-                    epochs=int(epochs),
-                    batch_size=int(batch_size),
-                    shuffle=True,
-                    callbacks=[lr_cb, mp, StreamlitProgress()],
-                    verbose=0
-                )
-
-            progress_bar.progress(100)
-            status_text.markdown("**Training progress:** Completed")
-
-            y_pred = model.predict(x_test, verbose=0).flatten()
-            test_rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
-
-            st.session_state.cnn_model = model
-            st.session_state.cnn_mp = mp
-            st.session_state.cnn_test_rmse = test_rmse
-            st.session_state.cnn_y_test = y_test
-            st.session_state.cnn_y_pred = y_pred
-            st.session_state.cnn_training_done = True
-
-            st.success("Model training completed successfully.")
-
-        except Exception as e:
-            st.session_state.cnn_training_done = False
-            st.error(f"Training failed: {e}")
-
-    if "cnn_mp" in st.session_state and st.session_state.cnn_training_done:
-        mp = st.session_state.cnn_mp
-        test_rmse = st.session_state.cnn_test_rmse
-        y_test = st.session_state.cnn_y_test
-        y_pred = st.session_state.cnn_y_pred
-
-        st.markdown("<div class='cnn-section-title'>4. Performance Overview</div>", unsafe_allow_html=True)
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Test RMSE", f"{test_rmse:.2f}°")
-        m2.metric("Training Iterations", f"{len(mp.iters)}")
-        m3.metric("Validation Checks", f"{len(mp.val_iters)}")
-
-        st.markdown("<div class='cnn-section-card'>", unsafe_allow_html=True)
-        st.markdown("#### Training Curves")
-
-        fig, (ax_top, ax_bot) = plt.subplots(
-            2, 1,
-            figsize=(14, 9.5),
-            sharex=True,
-            gridspec_kw={"hspace": 0.32}
-        )
-
-        tr_rmse = moving_average(mp.train_rmse, w=max(1, int(smooth_w)))
-        tr_loss = moving_average(mp.train_loss, w=max(1, int(smooth_w)))
-
-        # RMSE
-        ax_top.plot(mp.iters, tr_rmse, linewidth=2.4, label="Training RMSE")
-        if len(mp.val_iters) > 0:
-            ax_top.plot(mp.val_iters, mp.val_rmse, linewidth=2.4, label="Validation RMSE")
-
-        ax_top.set_ylabel("RMSE", fontsize=12, fontweight="bold")
-        ax_top.set_title("RMSE by Iteration", fontsize=16, fontweight="bold", pad=12)
-        ax_top.tick_params(axis="both", labelsize=11)
-        ax_top.grid(True, alpha=0.28)
-        ax_top.legend(loc="upper right", fontsize=11)
-
-        # Loss
-        ax_bot.plot(mp.iters, tr_loss, linewidth=2.4, label="Training Loss")
-        if len(mp.val_iters) > 0:
-            ax_bot.plot(mp.val_iters, mp.val_loss, linewidth=2.4, label="Validation Loss")
-
-        ax_bot.set_xlabel("Iteration", fontsize=12, fontweight="bold")
-        ax_bot.set_ylabel("Loss", fontsize=12, fontweight="bold")
-        ax_bot.set_title("Loss by Iteration", fontsize=16, fontweight="bold", pad=12)
-        ax_bot.tick_params(axis="both", labelsize=11)
-        ax_bot.grid(True, alpha=0.28)
-        ax_bot.legend(loc="upper right", fontsize=11)
-
-        for ax in (ax_top, ax_bot):
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-
-        fig.tight_layout(pad=2.0)
-        st.pyplot(fig, use_container_width=True)
-        plt.close(fig)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        st.markdown("<div class='cnn-section-card'>", unsafe_allow_html=True)
-        st.markdown("#### Predicted vs Actual")
-
-        fig_sc, ax_sc = plt.subplots(figsize=(11, 9))
-
-        ax_sc.scatter(
-            y_pred,
-            y_test,
-            alpha=0.28,
-            s=24
-        )
-
-        axis_min = min(float(np.min(y_pred)), float(np.min(y_test)), -60)
-        axis_max = max(float(np.max(y_pred)), float(np.max(y_test)), 60)
-
-        ax_sc.plot(
-            [axis_min, axis_max],
-            [axis_min, axis_max],
-            "r--",
-            linewidth=2.2,
-            label="Ideal Fit"
-        )
-
-        ax_sc.set_xlim(axis_min - 2, axis_max + 2)
-        ax_sc.set_ylim(axis_min - 2, axis_max + 2)
-
-        ax_sc.set_xlabel("Predicted Angle", fontsize=12, fontweight="bold")
-        ax_sc.set_ylabel("Actual Angle", fontsize=12, fontweight="bold")
-        ax_sc.set_title("Predicted vs Actual Rotation Angle", fontsize=17, fontweight="bold", pad=14)
-
-        ax_sc.tick_params(axis="both", labelsize=11)
-        ax_sc.grid(True, alpha=0.28)
-        ax_sc.legend(loc="upper left", fontsize=11)
-
-        ax_sc.spines["top"].set_visible(False)
-        ax_sc.spines["right"].set_visible(False)
-
-        fig_sc.tight_layout(pad=1.8)
-        st.pyplot(fig_sc, use_container_width=True)
-        plt.close(fig_sc)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    else:
-        st.info("Train the model to display evaluation results and charts.")
-
-    st.markdown("<div class='cnn-section-title'>5. Image Prediction</div>", unsafe_allow_html=True)
-
-    if saved_files:
-        if "cnn_model" not in st.session_state or not st.session_state.cnn_training_done:
-            st.warning("Images are ready. Train the model first to generate predictions.")
+def _lstm_bottom_nav(page_name: str):
+    idx = PAGES.index(page_name) if page_name in PAGES else 0
+    st.write("")
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        if idx == 0:
+            st.button("⬅ Back to Home", use_container_width=True, disabled=True, key=f"lstm_back_{page_name}")
         else:
-            model = st.session_state.cnn_model
-            results = []
-
-            st.markdown("<div class='cnn-section-card'>", unsafe_allow_html=True)
-            st.markdown("#### Prediction Results")
-
-            grid_cols = st.columns(4)
-
-            for idx, file in enumerate(saved_files):
-                try:
-                    file.seek(0)
-                except Exception:
-                    pass
-
-                img = Image.open(file).convert("L").resize((28, 28))
-                arr = np.array(img).astype("float32") / 255.0
-                arr = np.expand_dims(arr, -1)
-                arr = np.expand_dims(arr, 0)
-
-                pred = float(model.predict(arr, verbose=0)[0][0])
-
-                results.append({
-                    "Image": file.name,
-                    "Predicted Angle (°)": round(pred, 2)
-                })
-
-                with grid_cols[idx % 4]:
-                    st.image(img, width=150)
-                    st.markdown(
-                        f"""
-                        <div class="cnn-result-card">
-                            <b>{file.name}</b><br>
-                            Predicted angle: <b>{pred:.2f}°</b>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-
-            st.markdown("#### Prediction Table")
-            st.dataframe(pd.DataFrame(results), use_container_width=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-    else:
-        st.info("Upload one or more images to prepare prediction input.")
-# ============================================================
-# Routing (requested order)
-# Home → Data → Model → Preprocess → Train → Evaluate → Predict → Visualize → Save/Load
-# ============================================================
-PAGES = {
-    "home": ("Home", page_home),
-    "data": ("Data Upload", page_data),
-    "model": ("Model", page_model),
-    "preprocess": ("Preprocess", page_preprocess),
-    "train": ("Train", page_train),
-    "evaluate": ("Evaluate", page_evaluate),
-    "predict": ("Predict", page_predict),
-    "visualize": ("Visualize", page_visualize),
-    "save": ("Save/Load", page_save_load),
-    "cnn": ("CNN", page_cnn),
-}
+            prev_page = PAGES[idx - 1]
+            st.button(f"⬅ Back to {prev_page}", use_container_width=True, key=f"lstm_back_{page_name}", on_click=_lstm_go, args=(prev_page,))
+    with c2:
+        if idx >= len(PAGES) - 1:
+            st.button("Continue ➜", use_container_width=True, disabled=True, key=f"lstm_next_{page_name}")
+        else:
+            next_page = PAGES[idx + 1]
+            st.button(f"Continue to {next_page} ➜", use_container_width=True, key=f"lstm_next_{page_name}", on_click=_lstm_go, args=(next_page,))
 
 
+# -----------------------------
+# Main app
+# -----------------------------
 def main():
-    st.set_page_config(page_title="Neural Studio", layout="wide")
+    st.set_page_config(page_title=APP_TITLE, page_icon="⛽", layout="wide")
     inject_css()
-
-    apply_pending_nav()
+    init_state()
 
     with st.sidebar:
-        st.markdown("## Neural Studio")
-        st.caption("ML workflow builder (Python UI)")
+        st.markdown(f"### {APP_TITLE}")
+        selected = st.radio("Navigation", PAGES, index=PAGES.index(st.session_state["page"]))
+        st.session_state["page"] = selected
+        st.caption("Single-file professional LSTM workflow for oil and gas forecasting.")
 
-        cur = get_current_project()
-        if cur:
-            st.markdown(f"**Current:** {cur.get('name', 'Untitled')}")
-            st.caption(project_badge(cur))
-        else:
-            st.info("No current project.")
+        cfg = st.session_state["config"]
+        st.markdown("---")
+        st.write("**Current configuration**")
+        st.write(f"Lookback: {cfg['lookback']}")
+        st.write(f"Horizon: {cfg['horizon']}")
+        st.write(f"Targets: {len(cfg['target_cols'])}")
+        st.write(f"Transform: {cfg['transform_mode']}")
 
-        st.write("")
-        page_keys = list(PAGES.keys())
-        nav_page_keys = ["home", "data", "model", "preprocess", "train", "evaluate", "predict", "visualize", "save"]
-        labels = [PAGES[k][0] for k in nav_page_keys]
-
-        active_key = st.query_params.get("page", "home")
-        if active_key not in PAGES:
-            active_key = "home"
-
-        sidebar_active_key = "model" if active_key == "cnn" else active_key
-        idx = nav_page_keys.index(sidebar_active_key)
-
-        chosen = st.radio("Navigate", labels, index=idx)
-
-        chosen_key = nav_page_keys[labels.index(chosen)]
-        if chosen_key != sidebar_active_key:
-            request_nav(chosen_key)
-
-        st.write("---")
+        st.markdown("---")
         if st.button("➕ New Project", use_container_width=True):
-            new_project()
-            request_nav("data")
-
+            _lstm_reset_state("Data Upload")
         if st.button("🗑️ Clear Current Project", use_container_width=True):
-            if CURRENT_FILE.exists():
-                CURRENT_FILE.unlink()
-            request_nav("home")
+            _lstm_reset_state("Home")
 
-    apply_pending_nav()
+    page = st.session_state["page"]
+    if page == "Home":
+        page_home()
+    elif page == "Data Upload":
+        page_data_upload()
+    elif page == "Model":
+        page_model()
+    elif page == "Preprocess":
+        page_preprocess()
+    elif page == "Train":
+        page_train()
+    elif page == "Evaluate":
+        page_evaluate()
+    elif page == "Predict":
+        page_predict()
+    elif page == "Visualize":
+        page_visualize()
+    elif page == "Save/Load":
+        page_save_load()
 
-    active_key = st.query_params.get("page", "home")
-    if active_key not in PAGES:
-        active_key = "home"
-
-    bottom_nav(active_key)
-
-    _, renderer = PAGES[active_key]
-    renderer()
+    _lstm_bottom_nav(page)
 
 
 if __name__ == "__main__":
     main()
+'''
 
+
+
+import streamlit as st
+
+
+def get_sources():
+    return {
+        'ANN': ANN_SOURCE,
+        'CNN': CNN_SOURCE,
+        'LSTM': LSTM_SOURCE,
+    }
+
+
+def write_sources(output_dir: str | os.PathLike = 'extracted_sources_from_unified') -> Path:
+    target = Path(output_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    (target / 'ANN.py').write_text(ANN_SOURCE, encoding='utf-8')
+    (target / 'CNN.py').write_text(CNN_SOURCE, encoding='utf-8')
+    (target / 'LSTM.py').write_text(LSTM_SOURCE, encoding='utf-8')
+    return target
+
+
+def _patched_set_page_config(*args, **kwargs):
+    return None
+
+
+def _ensure_streamlit_shell() -> str:
+    st.set_page_config(page_title='Oil & Gas Neural Studio', layout='wide', initial_sidebar_state='expanded')
+
+    st.markdown(
+        """
+        <style>
+            .main .block-container {padding-top: 1.0rem; padding-bottom: 1.2rem;}
+            div[data-testid="stHorizontalBlock"] {gap: 0.55rem;}
+            .hero {
+                background: linear-gradient(135deg, #0f172a 0%, #1d4ed8 55%, #0ea5e9 100%);
+                padding: 1.3rem 1.5rem;
+                border-radius: 20px;
+                color: white;
+                margin-bottom: 1rem;
+                box-shadow: 0 10px 30px rgba(2,6,23,0.16);
+            }
+            .shell-card {
+                background: #ffffff;
+                border: 1px solid rgba(15,23,42,0.08);
+                border-radius: 18px;
+                padding: 1rem 1.1rem;
+                box-shadow: 0 8px 24px rgba(15,23,42,0.05);
+                margin-bottom: 0.9rem;
+            }
+            .shell-chip {
+                display:inline-block;
+                padding:0.28rem 0.6rem;
+                border-radius:999px;
+                background:#eff6ff;
+                border:1px solid #bfdbfe;
+                color:#1d4ed8;
+                font-size:0.85rem;
+                margin-right:0.35rem;
+                margin-bottom:0.35rem;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.sidebar:
+        st.markdown("## Oil & Gas Neural Studio")
+        st.caption("One Streamlit website for ANN, CNN, and LSTM.")
+        choice = st.selectbox(
+            "Active Model",
+            options=["ANN", "CNN", "LSTM"],
+            key="__unified_model_choice",
+        )
+
+    previous = st.session_state.get("__unified_active_model")
+    if previous != choice:
+        preserved = {
+            "__unified_model_choice": choice,
+            "__unified_active_model": choice,
+        }
+        for k in list(st.session_state.keys()):
+            if k not in preserved:
+                del st.session_state[k]
+        st.session_state["__unified_active_model"] = choice
+        st.rerun()
+
+    st.markdown(
+        f"""
+        <div class="hero">
+            <h2 style="margin:0 0 0.35rem 0;">Oil &amp; Gas Neural Studio</h2>
+            <div style="font-size:1rem; line-height:1.55;">
+                One Streamlit website for ANN, LSTM, and CNN oil &amp; gas workflows.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    chips = [
+        f"<span class='shell-chip'>Mode: {choice}</span>",
+        "<span class='shell-chip'>Unified File: Yes</span>",
+        "<span class='shell-chip'>Source Integrity: Embedded</span>",
+    ]
+    st.markdown("".join(chips), unsafe_allow_html=True)
+
+    return choice
+
+
+def launch_selected_source() -> None:
+    model_name = _ensure_streamlit_shell()
+    source = get_sources()[model_name]
+
+    # Prevent duplicate page-config crashes from the embedded original apps.
+    st.set_page_config = _patched_set_page_config
+
+    namespace = {
+        '__name__': '__main__',
+        '__file__': str(Path(__file__).resolve()),
+        '__package__': None,
+        '__cached__': None,
+        '__doc__': None,
+    }
+    exec(compile(source, f'<{model_name}_SOURCE>', 'exec'), namespace, namespace)
+
+
+def main() -> None:
+    if '--extract' in sys.argv:
+        target = write_sources()
+        print(f'Extracted original sources to: {target.resolve()}')
+        return
+    launch_selected_source()
+
+
+if __name__ == '__main__':
+    main()
