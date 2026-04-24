@@ -1975,6 +1975,13 @@ def infer_dataset_structure(extract_dir: Path) -> pd.DataFrame:
 
 def finalize_splits(df: pd.DataFrame, val_ratio: float, seed: int) -> pd.DataFrame:
     df = df.copy()
+    # Pandas on Streamlit Cloud can infer an all-missing split column as float64.
+    # Assigning strings like "train"/"val" into that column then crashes with a TypeError.
+    # Force object dtype first so split labels remain valid across pandas versions.
+    if "split" not in df.columns:
+        df["split"] = pd.Series(index=df.index, dtype="object")
+    else:
+        df["split"] = df["split"].astype("object")
     if df["split"].notna().any():
         # keep explicit train/val/test splits; if only train exists, create val from train
         present = set(df["split"].dropna().unique().tolist())
@@ -3517,7 +3524,6 @@ def default_config() -> Dict:
         "loss": "mse",
         "seed": 42,
         "project_name": "oil_gas_lstm_project",
-        "task_mode": "Auto Detect",
     }
 
 
@@ -4474,75 +4480,7 @@ def page_data_upload():
 
 
 def page_model():
-    hero("Model", "Define the LSTM architecture and training settings. Keep date/features/targets/window design in Preprocess.")
-    df = st.session_state.get("raw_df")
-    if df is None:
-        st.info("Load data first.")
-        return
-
-    cfg = st.session_state["config"]
-    task_options = ["Auto Detect", "Regression", "Classification"]
-    if cfg.get("task_mode") not in task_options:
-        cfg["task_mode"] = "Auto Detect"
-
-    with st.form("model_form"):
-        c1, c2 = st.columns(2)
-        with c1:
-            cfg["project_name"] = st.text_input("Project name", value=cfg["project_name"])
-            cfg["task_mode"] = st.selectbox("Task", task_options, index=task_options.index(cfg["task_mode"]))
-            cfg["lstm_units_1"] = st.number_input("LSTM units 1", min_value=8, max_value=512, value=int(cfg["lstm_units_1"]), step=8)
-            cfg["lstm_units_2"] = st.number_input("LSTM units 2", min_value=8, max_value=512, value=int(cfg["lstm_units_2"]), step=8)
-            cfg["lstm_units_3"] = st.number_input("LSTM units 3", min_value=8, max_value=512, value=int(cfg["lstm_units_3"]), step=8)
-            cfg["dense_units"] = st.number_input("Dense units", min_value=8, max_value=512, value=int(cfg["dense_units"]), step=8)
-        with c2:
-            cfg["dropout"] = st.slider("Dropout", min_value=0.0, max_value=0.8, value=float(cfg["dropout"]), step=0.05)
-            cfg["loss"] = st.selectbox("Loss", ["mse", "mae", "huber"], index=["mse", "mae", "huber"].index(cfg["loss"]))
-            cfg["learning_rate"] = st.number_input("Learning rate", min_value=1e-6, max_value=1.0, value=float(cfg["learning_rate"]), format="%.6f")
-            cfg["batch_size"] = st.number_input("Batch size", min_value=1, max_value=1024, value=int(cfg["batch_size"]), step=1)
-            cfg["epochs"] = st.number_input("Epochs", min_value=1, max_value=1000, value=int(cfg["epochs"]), step=1)
-            cfg["patience"] = st.number_input("Early stopping patience", min_value=1, max_value=200, value=int(cfg["patience"]), step=1)
-            cfg["seed"] = st.number_input("Random seed", min_value=0, max_value=999999, value=int(cfg["seed"]), step=1)
-        submitted = st.form_submit_button("Save Model Settings")
-
-    if submitted:
-        reset_after_data_change()
-        st.success("Model configuration saved.")
-
-    st.info("Use Preprocess for date column, feature columns, target columns, lookback, horizon, scaling, transforms, and splits. Use Model for task visibility, architecture, and optimization only.")
-    if cfg["task_mode"] == "Classification":
-        st.warning("Classification is visible here now for sequence consistency, but this embedded LSTM implementation in this file still runs a forecasting/regression pipeline. Choose Regression or Auto Detect unless you are ready to extend the backend too.")
-
-    st.markdown("### Architecture Summary")
-    s1, s2, s3, s4 = st.columns(4)
-    s1.metric("Task", cfg["task_mode"])
-    s2.metric("LSTM 1", int(cfg["lstm_units_1"]))
-    s3.metric("LSTM 2", int(cfg["lstm_units_2"]))
-    s4.metric("LSTM 3", int(cfg["lstm_units_3"]))
-
-    s5, s6, s7, s8 = st.columns(4)
-    s5.metric("Dense", int(cfg["dense_units"]))
-    s6.metric("Dropout", f"{float(cfg['dropout']):.2f}")
-    s7.metric("Loss", str(cfg["loss"]).upper())
-    s8.metric("Epochs / Batch", f"{int(cfg['epochs'])} / {int(cfg['batch_size'])}")
-
-    st.markdown("**Model stack preview**")
-    stack_df = pd.DataFrame(
-        {
-            "Layer": ["Input sequence", "LSTM block 1", "LSTM block 2", "LSTM block 3", "Dense head", "Output head"],
-            "Configuration": [
-                "(lookback, channels) from Preprocess",
-                f"LSTM({int(cfg['lstm_units_1'])}) + LayerNorm + Dropout({float(cfg['dropout']):.2f})",
-                f"LSTM({int(cfg['lstm_units_2'])}) + LayerNorm + Dropout({float(cfg['dropout']):.2f})",
-                f"LSTM({int(cfg['lstm_units_3'])}) + LayerNorm + Dropout({float(cfg['dropout']):.2f})",
-                f"Dense({int(cfg['dense_units'])}, relu) + Dropout({float(cfg['dropout']):.2f})",
-                "Dense(horizon × number_of_targets)",
-            ],
-        }
-    )
-    st.dataframe(stack_df, use_container_width=True, hide_index=True)
-
-def page_preprocess():
-    hero("Preprocess", "Choose the date, features, targets, sequence windows, transforms, scaling, and chronological split.")
+    hero("Model", "Set forecasting targets, sequence design, and network architecture.")
     df = st.session_state.get("raw_df")
     if df is None:
         st.info("Load data first.")
@@ -4550,70 +4488,83 @@ def page_preprocess():
 
     cfg = st.session_state["config"]
     guessed_date = detect_date_column(df)
-    all_date_options = [None] + list(df.columns)
-    if guessed_date and (cfg.get("date_col") is None or cfg.get("date_col") not in df.columns):
+    numeric_cols = get_numeric_columns(df, exclude=[guessed_date] if guessed_date else [])
+    if guessed_date and (cfg["date_col"] is None or cfg["date_col"] not in df.columns):
         cfg["date_col"] = guessed_date
+    if not cfg["feature_cols"]:
+        cfg["feature_cols"] = numeric_cols[:]
+    if not cfg["target_cols"]:
+        cfg["target_cols"] = numeric_cols[: min(4, len(numeric_cols))]
 
-    candidate_numeric = get_numeric_columns(df, exclude=[cfg["date_col"]] if cfg.get("date_col") else [])
-    if not cfg.get("feature_cols"):
-        cfg["feature_cols"] = candidate_numeric[:]
-    if not cfg.get("target_cols"):
-        cfg["target_cols"] = candidate_numeric[:1]
-
-    with st.form("preprocess_form"):
-        current_date = cfg.get("date_col") if cfg.get("date_col") in df.columns else None
-        cfg["date_col"] = st.selectbox(
-            "Date column",
-            options=all_date_options,
-            index=all_date_options.index(current_date) if current_date in all_date_options else 0,
-            format_func=lambda x: "(None)" if x is None else x,
-        )
-
-        numeric_cols = get_numeric_columns(df, exclude=[cfg["date_col"]] if cfg.get("date_col") else [])
-
-        cfg["feature_cols"] = st.multiselect(
-            "Feature columns",
-            options=numeric_cols,
-            default=[c for c in cfg.get("feature_cols", []) if c in numeric_cols],
-        )
-
-        if cfg.get("task_mode") == "Classification":
-            current_target = cfg.get("target_cols", [None])[0] if cfg.get("target_cols") else None
-            current_target = current_target if current_target in numeric_cols else (numeric_cols[0] if numeric_cols else None)
-            selected_target = st.selectbox(
-                "Target column",
-                options=numeric_cols,
-                index=numeric_cols.index(current_target) if current_target in numeric_cols else 0,
-            )
-            cfg["target_cols"] = [selected_target] if selected_target else []
-        else:
-            cfg["target_cols"] = st.multiselect(
-                "Target columns",
-                options=numeric_cols,
-                default=[c for c in cfg.get("target_cols", []) if c in numeric_cols],
-            )
-
-        st.write("")
-        c1, c2, c3 = st.columns(3)
+    with st.form("model_form"):
+        c1, c2 = st.columns(2)
         with c1:
+            cfg["project_name"] = st.text_input("Project name", value=cfg["project_name"])
+            cfg["date_col"] = st.selectbox("Date column", options=[None] + list(df.columns), index=([None] + list(df.columns)).index(cfg["date_col"]) if cfg["date_col"] in df.columns else 0)
+            cfg["feature_cols"] = st.multiselect("Feature columns", options=numeric_cols, default=[c for c in cfg["feature_cols"] if c in numeric_cols])
+            cfg["target_cols"] = st.multiselect("Target columns", options=numeric_cols, default=[c for c in cfg["target_cols"] if c in numeric_cols])
             cfg["lookback"] = st.number_input("Lookback window", min_value=2, max_value=365, value=int(cfg["lookback"]), step=1)
             cfg["horizon"] = st.number_input("Forecast horizon", min_value=1, max_value=30, value=int(cfg["horizon"]), step=1)
+        with c2:
+            cfg["lstm_units_1"] = st.number_input("LSTM units 1", min_value=8, max_value=512, value=int(cfg["lstm_units_1"]), step=8)
+            cfg["lstm_units_2"] = st.number_input("LSTM units 2", min_value=8, max_value=512, value=int(cfg["lstm_units_2"]), step=8)
+            cfg["lstm_units_3"] = st.number_input("LSTM units 3", min_value=8, max_value=512, value=int(cfg["lstm_units_3"]), step=8)
+            cfg["dense_units"] = st.number_input("Dense units", min_value=8, max_value=512, value=int(cfg["dense_units"]), step=8)
+            cfg["dropout"] = st.slider("Dropout", min_value=0.0, max_value=0.8, value=float(cfg["dropout"]), step=0.05)
+            cfg["loss"] = st.selectbox("Loss", ["mse", "mae", "huber"], index=["mse", "mae", "huber"].index(cfg["loss"]))
+            cfg["seed"] = st.number_input("Random seed", min_value=0, max_value=999999, value=int(cfg["seed"]), step=1)
+        submitted = st.form_submit_button("Save Model Settings")
+
+    if submitted:
+        reset_after_data_change()
+        st.success("Model configuration saved.")
+
+    st.markdown("### Model Design Summary")
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Features", len(cfg["feature_cols"]))
+    s2.metric("Targets", len(cfg["target_cols"]))
+    s3.metric("Lookback", int(cfg["lookback"]))
+    s4.metric("Horizon", int(cfg["horizon"]))
+
+    a, b = st.columns(2)
+    with a:
+        st.markdown("**Selected Inputs**")
+        st.dataframe(pd.DataFrame({"Feature Columns": cfg["feature_cols"]}), use_container_width=True, hide_index=True, height=260)
+    with b:
+        st.markdown("**Prediction Targets**")
+        st.dataframe(pd.DataFrame({"Target Columns": cfg["target_cols"]}), use_container_width=True, hide_index=True, height=260)
+
+    with st.expander("Full configuration", expanded=False):
+        st.code(json.dumps(cfg, indent=2, default=str), language="json")
+
+
+def page_preprocess():
+    hero("Preprocess", "Clean the series, transform it, split it sequentially, and build LSTM windows.")
+    df = st.session_state.get("raw_df")
+    if df is None:
+        st.info("Load data first.")
+        return
+
+    cfg = st.session_state["config"]
+    with st.form("preprocess_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
             cfg["transform_mode"] = st.selectbox(
                 "Target/data transform",
                 ["raw", "pct_change", "log_return"],
                 index=["raw", "pct_change", "log_return"].index(cfg["transform_mode"]),
             )
-        with c2:
             cfg["missing_method"] = st.selectbox(
                 "Missing value handling",
                 ["ffill_bfill", "interpolate", "drop", "ffill", "bfill", "median_impute"],
                 index=["ffill_bfill", "interpolate", "drop", "ffill", "bfill", "median_impute"].index(cfg["missing_method"]),
             )
             cfg["resample_rule"] = st.selectbox("Resample rule", ["None", "D", "W", "M"], index=["None", "D", "W", "M"].index(cfg["resample_rule"]))
+        with c2:
             cfg["scale_method"] = st.selectbox("Scaling", ["standard", "minmax", "robust"], index=["standard", "minmax", "robust"].index(cfg["scale_method"]))
-        with c3:
             cfg["train_frac"] = st.slider("Train fraction", min_value=0.50, max_value=0.85, value=float(cfg["train_frac"]), step=0.05)
             cfg["val_frac"] = st.slider("Validation fraction", min_value=0.05, max_value=0.30, value=float(cfg["val_frac"]), step=0.05)
+        with c3:
             cfg["clip_outliers"] = st.checkbox("Clip outliers by quantile", value=bool(cfg["clip_outliers"]))
             cfg["clip_low_q"] = st.number_input("Lower quantile", min_value=0.0, max_value=0.20, value=float(cfg["clip_low_q"]), step=0.005)
             cfg["clip_high_q"] = st.number_input("Upper quantile", min_value=0.80, max_value=1.0, value=float(cfg["clip_high_q"]), step=0.005)
@@ -4621,12 +4572,6 @@ def page_preprocess():
 
     if submitted:
         try:
-            if not cfg["feature_cols"]:
-                raise ValueError("Select at least one feature column.")
-            if not cfg["target_cols"]:
-                raise ValueError("Select at least one target column.")
-            if cfg.get("task_mode") == "Classification":
-                raise ValueError("LSTM classification is visible now for workflow consistency, but this embedded LSTM file still trains a forecasting/regression pipeline only. Switch Task to Regression or Auto Detect.")
             if cfg["train_frac"] + cfg["val_frac"] >= 0.95:
                 raise ValueError("Train fraction + validation fraction must leave room for a test set.")
             processed = preprocess_dataset(df, cfg)
@@ -4642,62 +4587,46 @@ def page_preprocess():
         st.info("Configure preprocessing and click Run Preprocessing.")
         return
 
-    st.markdown("### Processed Sequence Summary")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Task", cfg.get("task_mode", "Auto Detect"))
-    m2.metric("Feature Columns", len(cfg["feature_cols"]))
-    m3.metric("Target Columns", len(cfg["target_cols"]))
-    m4.metric("Rows Used", len(processed["transformed"]))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Processed Rows", len(processed["transformed"]))
+    c2.metric("Train Sequences", len(processed["X_train"]))
+    c3.metric("Validation Sequences", len(processed["X_val"]))
+    c4.metric("Test Sequences", len(processed["X_test"]))
 
-    m5, m6, m7, m8 = st.columns(4)
-    m5.metric("Lookback", int(cfg["lookback"]))
-    m6.metric("Horizon", int(cfg["horizon"]))
-    m7.metric("Train Sequences", len(processed["X_train"]))
-    m8.metric("Val/Test", f"{len(processed['X_val'])} / {len(processed['X_test'])}")
+    st.markdown("**Sequential Data Split Overview**")
+    split_left, split_center, split_right = st.columns([1, 2.4, 1])
+    with split_center:
+        st.pyplot(
+            fig_split_overview(processed["dates"], processed["train_end_idx"], processed["val_end_idx"], "Sequential Data Split Overview"),
+            use_container_width=True,
+        )
 
-    fig = fig_split_overview(
-        pd.to_datetime(processed["dates"], errors="coerce"),
-        int(processed["train_end_idx"]),
-        int(processed["val_end_idx"]),
-        "Sequential Data Split Overview",
-    )
-    if fig is not None:
-        center_left, center_mid, center_right = st.columns([1.4, 1.8, 1.4])
-        with center_mid:
-            st.pyplot(fig, use_container_width=True)
+    st.write("**Transformed data preview**")
+    preview = processed["transformed"].copy()
+    preview.insert(0, "date", processed["dates"])
+    st.dataframe(preview.head(20), use_container_width=True)
+
 
 def page_train():
-    hero("Train", "Train the LSTM with the settings you already fixed in Model. Stop redefining the same thing twice.")
+    hero("Train", "Train the LSTM and keep the best checkpoint instead of praying at a random epoch.")
     processed = st.session_state.get("processed")
     if processed is None:
         st.info("Preprocess data first.")
         return
 
     cfg = st.session_state["config"]
-    if cfg.get("task_mode") == "Classification":
-        st.error("LSTM classification is visible in the Model page now, but this embedded LSTM implementation in this file still only supports the forecasting/regression training path. Switch Task to Regression or Auto Detect.")
-        return
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        cfg["epochs"] = st.number_input("Epochs", min_value=1, max_value=1000, value=int(cfg["epochs"]), step=1)
+    with c2:
+        cfg["batch_size"] = st.number_input("Batch size", min_value=1, max_value=1024, value=int(cfg["batch_size"]), step=1)
+    with c3:
+        cfg["learning_rate"] = st.number_input("Learning rate", min_value=1e-6, max_value=1.0, value=float(cfg["learning_rate"]), format="%.6f")
+    with c4:
+        cfg["patience"] = st.number_input("Early stopping patience", min_value=1, max_value=200, value=int(cfg["patience"]), step=1)
 
-    st.markdown("### Training Summary")
-    t1, t2, t3, t4 = st.columns(4)
-    t1.metric("Task", cfg.get("task_mode", "Auto Detect"))
-    t2.metric("Targets", len(processed["target_cols"]))
-    t3.metric("Lookback", int(cfg["lookback"]))
-    t4.metric("Horizon", int(cfg["horizon"]))
-
-    t5, t6, t7, t8 = st.columns(4)
-    t5.metric("Train Sequences", len(processed["X_train"]))
-    t6.metric("Validation Sequences", len(processed["X_val"]))
-    t7.metric("Test Sequences", len(processed["X_test"]))
-    t8.metric("Input Shape", f"{processed['X_train'].shape[1]} × {processed['X_train'].shape[2]}")
-
-    t9, t10, t11, t12 = st.columns(4)
-    t9.metric("Epochs", int(cfg["epochs"]))
-    t10.metric("Batch Size", int(cfg["batch_size"]))
-    t11.metric("Learning Rate", f"{float(cfg['learning_rate']):.6f}")
-    t12.metric("Patience", int(cfg["patience"]))
-
-    if st.button("Start Training", type="primary"):
+    train_now = st.button("Start Training", type="primary")
+    if train_now:
         try:
             with st.spinner("Training model..."):
                 training = train_model(processed, cfg)
@@ -4711,14 +4640,30 @@ def page_train():
         st.info("Press Start Training.")
         return
 
-    hist_left, hist_center, hist_right = st.columns([1, 2.1, 1])
+    st.markdown("### Training Summary")
+    t1, t2, t3, t4 = st.columns(4)
+    t1.metric("Train Sequences", len(processed["X_train"]))
+    t2.metric("Validation Sequences", len(processed["X_val"]))
+    t3.metric("Test Sequences", len(processed["X_test"]))
+    t4.metric("Input Shape", f"{processed['X_train'].shape[1]} × {processed['X_train'].shape[2]}")
+
+    t5, t6, t7, t8 = st.columns(4)
+    t5.metric("Epochs", int(cfg["epochs"]))
+    t6.metric("Batch Size", int(cfg["batch_size"]))
+    t7.metric("Learning Rate", f"{float(cfg['learning_rate']):.6f}")
+    t8.metric("Patience", int(cfg["patience"]))
+
+    hist_left, hist_center, hist_right = st.columns([1, 2.4, 1])
     with hist_center:
         st.pyplot(fig_training_history(training["history"]), use_container_width=True)
 
-    st.markdown("### Model summary")
-    summary_text = str(training.get("model_summary", "")).strip()
-    if summary_text:
-        st.code(summary_text, language="text")
+    with st.container(border=True):
+        st.markdown("**Model summary**")
+        st.code(training["model_summary"], language="text")
+
+    st.write("**Validation metrics**")
+    st.dataframe(training["metrics"]["val"], use_container_width=True, hide_index=True)
+
 
 def page_evaluate():
     hero("Evaluate", "Check whether the model learned signal or just learned how to disappoint you more elegantly.")
@@ -5044,7 +4989,6 @@ def main():
         cfg = st.session_state["config"]
         st.markdown("---")
         st.write("**Current configuration**")
-        st.write(f"Task: {cfg.get('task_mode', 'Auto Detect')}")
         st.write(f"Lookback: {cfg['lookback']}")
         st.write(f"Horizon: {cfg['horizon']}")
         st.write(f"Targets: {len(cfg['target_cols'])}")
