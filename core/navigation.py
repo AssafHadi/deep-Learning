@@ -28,6 +28,13 @@ def render_sidebar() -> tuple[str, str]:
         switch_model(model_name)
 
         selected = get_selected_page()
+
+        # Keep the sidebar radio widget synchronized with programmatic navigation.
+        # Without this, bottom Back/Continue buttons update __ns_selected_page,
+        # but the existing radio widget state can immediately overwrite it on rerun.
+        if st.session_state.get("__ns_workflow_radio") != selected:
+            st.session_state["__ns_workflow_radio"] = selected
+
         page_name = st.radio(
             "Workflow",
             WORKFLOW_PAGES,
@@ -46,30 +53,20 @@ def render_sidebar() -> tuple[str, str]:
 def render_status(model_name: str) -> None:
     with model_state_context(model_name):
         st.markdown(f"### {model_name} Status")
-
         if model_name == "ANN":
-            data_ready = st.session_state.get("raw_df") is not None
-            prepared = st.session_state.get("prepared_data") is not None
-            trained = st.session_state.get("trained_model") is not None
-            st.markdown(f'<span class="status-pill">Dataset: {"Ready" if data_ready else "Missing"}</span>', unsafe_allow_html=True)
-            st.markdown(f'<span class="status-pill">Prepared: {"Yes" if prepared else "No"}</span>', unsafe_allow_html=True)
-            st.markdown(f'<span class="status-pill">Model: {"Trained/Loaded" if trained else "None"}</span>', unsafe_allow_html=True)
-
+            st.markdown(f'<span class="status-pill">Dataset: {"Ready" if st.session_state.raw_df is not None else "Missing"}</span>', unsafe_allow_html=True)
+            st.markdown(f'<span class="status-pill">Prepared: {"Yes" if st.session_state.prepared_data is not None else "No"}</span>', unsafe_allow_html=True)
+            st.markdown(f'<span class="status-pill">Model: {"Trained/Loaded" if st.session_state.trained_model is not None else "None"}</span>', unsafe_allow_html=True)
         elif model_name == "CNN":
-            data_ready = st.session_state.get("dataset_df") is not None
-            trained = st.session_state.get("trained_model") is not None
+            data_ready = bool(st.session_state.get("splits"))
+            trained = st.session_state.get("model") is not None
             st.markdown(f'<span class="status-pill">Dataset: {"Ready" if data_ready else "Missing"}</span>', unsafe_allow_html=True)
             st.markdown(f'<span class="status-pill">Model: {"Trained/Loaded" if trained else "None"}</span>', unsafe_allow_html=True)
             st.markdown(f'<span class="status-pill">Classes: {len(st.session_state.get("class_names", []))}</span>', unsafe_allow_html=True)
-
         elif model_name == "LSTM":
-            data_ready = st.session_state.get("raw_df") is not None
-            prepared = st.session_state.get("processed") is not None
-            training = st.session_state.get("training")
-            trained = isinstance(training, dict) and training.get("model") is not None
-            st.markdown(f'<span class="status-pill">Dataset: {"Ready" if data_ready else "Missing"}</span>', unsafe_allow_html=True)
-            st.markdown(f'<span class="status-pill">Prepared: {"Yes" if prepared else "No"}</span>', unsafe_allow_html=True)
-            st.markdown(f'<span class="status-pill">Model: {"Trained/Loaded" if trained else "None"}</span>', unsafe_allow_html=True)
+            st.markdown(f'<span class="status-pill">Dataset: {"Ready" if st.session_state.raw_df is not None else "Missing"}</span>', unsafe_allow_html=True)
+            st.markdown(f'<span class="status-pill">Prepared: {"Yes" if st.session_state.processed is not None else "No"}</span>', unsafe_allow_html=True)
+            st.markdown(f'<span class="status-pill">Model: {"Trained/Loaded" if st.session_state.model is not None else "None"}</span>', unsafe_allow_html=True)
 
 
 def render_project_actions(model_name: str) -> None:
