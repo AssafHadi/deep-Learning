@@ -29,9 +29,7 @@ def render_sidebar() -> tuple[str, str]:
 
         selected = get_selected_page()
 
-        # Keep the sidebar radio widget synchronized with programmatic navigation.
-        # Without this, bottom Back/Continue buttons update __ns_selected_page,
-        # but the existing radio widget state can immediately overwrite it on rerun.
+        
         if st.session_state.get("__ns_workflow_radio") != selected:
             st.session_state["__ns_workflow_radio"] = selected
 
@@ -64,9 +62,27 @@ def render_status(model_name: str) -> None:
             st.markdown(f'<span class="status-pill">Model: {"Trained/Loaded" if trained else "None"}</span>', unsafe_allow_html=True)
             st.markdown(f'<span class="status-pill">Classes: {len(st.session_state.get("class_names", []))}</span>', unsafe_allow_html=True)
         elif model_name == "LSTM":
-            st.markdown(f'<span class="status-pill">Dataset: {"Ready" if st.session_state.raw_df is not None else "Missing"}</span>', unsafe_allow_html=True)
-            st.markdown(f'<span class="status-pill">Prepared: {"Yes" if st.session_state.processed is not None else "No"}</span>', unsafe_allow_html=True)
-            st.markdown(f'<span class="status-pill">Model: {"Trained/Loaded" if st.session_state.model is not None else "None"}</span>', unsafe_allow_html=True)
+    data_ready = st.session_state.get("raw_df") is not None
+    prepared = st.session_state.get("processed") is not None
+
+    training = st.session_state.get("training")
+    trained = False
+    if isinstance(training, dict):
+        trained = training.get("model") is not None
+    trained = trained or st.session_state.get("model") is not None
+
+    st.markdown(
+        f'<span class="status-pill">Dataset: {"Ready" if data_ready else "Missing"}</span>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<span class="status-pill">Prepared: {"Yes" if prepared else "No"}</span>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<span class="status-pill">Model: {"Trained/Loaded" if trained else "None"}</span>',
+        unsafe_allow_html=True,
+    )
 
 
 def render_project_actions(model_name: str) -> None:
