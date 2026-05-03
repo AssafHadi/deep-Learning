@@ -10,8 +10,8 @@ from core.state import (
     reset_model_project,
     set_selected_page,
     switch_model,
-    model_state_context,
 )
+
 
 _PAGE_MODULES = {
     "Home": "pages.home",
@@ -26,22 +26,85 @@ _PAGE_MODULES = {
 }
 
 
+def _model_radio_color(model_name: str) -> str:
+    colors = {
+        "ANN": "#1e3a8a",   # dark blue
+        "CNN": "#065f46",   # dark green
+        "LSTM": "#4b5563",  # gray
+    }
+    return colors.get(model_name, colors["ANN"])
+
+
+def _inject_sidebar_radio_css(model_name: str) -> None:
+    color = _model_radio_color(model_name)
+
+    st.markdown(
+        f"""
+        <style>
+            section[data-testid="stSidebar"] .stSelectbox div[data-baseweb="select"] > div {{
+                border-color: {color} !important;
+            }}
+
+            section[data-testid="stSidebar"] div[role="radiogroup"] label,
+            section[data-testid="stSidebar"] div[role="radiogroup"] label * {{
+                color: #0f172a !important;
+                font-weight: 400 !important;
+                background: transparent !important;
+            }}
+
+            section[data-testid="stSidebar"] div[role="radiogroup"] label[data-baseweb="radio"] > div:first-child {{
+                width: 16px !important;
+                height: 16px !important;
+                min-width: 16px !important;
+                min-height: 16px !important;
+                border-radius: 50% !important;
+                border: 1.5px solid #9ca3af !important;
+                background-color: white !important;
+                box-sizing: border-box !important;
+                display: flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                margin-right: 0.45rem !important;
+            }}
+
+            section[data-testid="stSidebar"] div[role="radiogroup"] label[data-baseweb="radio"]:has(input:checked) > div:first-child {{
+                border-color: {color} !important;
+                background-color: white !important;
+            }}
+
+            section[data-testid="stSidebar"] div[role="radiogroup"] label[data-baseweb="radio"]:has(input:checked) > div:first-child > div {{
+                width: 8px !important;
+                height: 8px !important;
+                min-width: 8px !important;
+                min-height: 8px !important;
+                border-radius: 50% !important;
+                background-color: {color} !important;
+                display: block !important;
+            }}
+
+            section[data-testid="stSidebar"] div[role="radiogroup"] label[data-baseweb="radio"]:not(:has(input:checked)) > div:first-child > div {{
+                background-color: transparent !important;
+            }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _sync_sidebar_page() -> None:
-    """Update selected page when the sidebar radio changes."""
     page_name = st.session_state.get("__ns_workflow_radio", "Home")
     set_selected_page(page_name)
 
 
 def _goto_page(page_name: str) -> None:
-    """Update selected page from bottom navigation buttons."""
     set_selected_page(page_name)
     st.session_state["__ns_workflow_radio"] = page_name
 
 
 def render_sidebar() -> tuple[str, str]:
     with st.sidebar:
-        st.markdown("## Oil & Gas Neural Studio")
-        st.caption("True layered architecture")
+        st.markdown("## Deep Learning Platform")
+        st.caption("Choose a model and follow the workflow.")
 
         model_name = st.selectbox(
             "Active Model",
@@ -50,6 +113,7 @@ def render_sidebar() -> tuple[str, str]:
         )
 
         switch_model(model_name)
+        _inject_sidebar_radio_css(model_name)
 
         selected_page = get_selected_page()
 
@@ -69,96 +133,34 @@ def render_sidebar() -> tuple[str, str]:
         page_name = get_selected_page()
 
         st.markdown("---")
-        render_status(model_name)
-        st.markdown("---")
         render_project_actions(model_name)
 
     return model_name, page_name
-
-
-def render_status(model_name: str) -> None:
-    with model_state_context(model_name):
-        st.markdown(f"### {model_name} Status")
-
-        if model_name == "ANN":
-            data_ready = st.session_state.get("raw_df") is not None
-            prepared = st.session_state.get("prepared_data") is not None
-            trained = st.session_state.get("trained_model") is not None
-
-            st.markdown(
-                f'<span class="status-pill">Dataset: {"Ready" if data_ready else "Missing"}</span>',
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f'<span class="status-pill">Prepared: {"Yes" if prepared else "No"}</span>',
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f'<span class="status-pill">Model: {"Trained/Loaded" if trained else "None"}</span>',
-                unsafe_allow_html=True,
-            )
-
-        elif model_name == "CNN":
-            data_ready = bool(st.session_state.get("dataset_df")) or bool(st.session_state.get("splits"))
-            trained = (
-                st.session_state.get("trained_model") is not None
-                or st.session_state.get("model") is not None
-            )
-            class_names = st.session_state.get("class_names", [])
-
-            st.markdown(
-                f'<span class="status-pill">Dataset: {"Ready" if data_ready else "Missing"}</span>',
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f'<span class="status-pill">Model: {"Trained/Loaded" if trained else "None"}</span>',
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f'<span class="status-pill">Classes: {len(class_names)}</span>',
-                unsafe_allow_html=True,
-            )
-
-        elif model_name == "LSTM":
-            data_ready = st.session_state.get("raw_df") is not None
-            prepared = st.session_state.get("processed") is not None
-
-            training = st.session_state.get("training")
-            trained = False
-
-            if isinstance(training, dict):
-                trained = training.get("model") is not None
-
-            trained = trained or st.session_state.get("model") is not None
-
-            st.markdown(
-                f'<span class="status-pill">Dataset: {"Ready" if data_ready else "Missing"}</span>',
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f'<span class="status-pill">Prepared: {"Yes" if prepared else "No"}</span>',
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f'<span class="status-pill">Model: {"Trained/Loaded" if trained else "None"}</span>',
-                unsafe_allow_html=True,
-            )
 
 
 def render_project_actions(model_name: str) -> None:
     col1, col2 = st.columns(2)
 
     with col1:
-        if st.button("➕ New", use_container_width=True, key=f"__ns_new_{model_name}"):
+        if st.button(
+            "➕ New",
+            use_container_width=True,
+            key=f"__ns_new_{model_name}",
+        ):
             reset_model_project(model_name, "Data Upload")
 
     with col2:
-        if st.button("🗑️ Clear", use_container_width=True, key=f"__ns_clear_{model_name}"):
+        if st.button(
+            "🗑️ Clear",
+            use_container_width=True,
+            key=f"__ns_clear_{model_name}",
+        ):
             reset_model_project(model_name, "Home")
 
 
 def render_current_page(model_name: str, page_name: str) -> None:
-    module = import_module(_PAGE_MODULES.get(page_name, "pages.home"))
+    module_path = _PAGE_MODULES.get(page_name, "pages.home")
+    module = import_module(module_path)
     module.render(model_name)
 
 
