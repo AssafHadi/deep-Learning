@@ -185,34 +185,42 @@ def render_lstm_preprocess_ui():
         non_date_cols = [c for c in all_cols if c != cfg.get("date_col")]
         cfg["classification_target_col"] = non_date_cols[0] if non_date_cols else None
 
-    with st.form("preprocess_form"):
-        st.markdown("#### Column selection and sequence setup")
-        a1, a2, a3 = st.columns(3)
-        with a1:
-            date_options = [None] + all_cols
-            date_index = date_options.index(cfg["date_col"]) if cfg.get("date_col") in date_options else 0
-            cfg["date_col"] = st.selectbox("Date column", options=date_options, index=date_index)
-        with a2:
-            cfg["feature_cols"] = st.multiselect(
-                "Feature columns",
-                options=numeric_cols,
-                default=[c for c in cfg.get("feature_cols", []) if c in numeric_cols],
-                help="Numeric sequence inputs used by the LSTM.",
+            st.markdown("#### Column selection and sequence setup")
+
+        date_options = [None] + all_cols
+        date_index = date_options.index(cfg["date_col"]) if cfg.get("date_col") in date_options else 0
+
+        cfg["date_col"] = st.selectbox(
+            "Date column",
+            options=date_options,
+            index=date_index,
+        )
+
+        cfg["feature_cols"] = st.multiselect(
+            "Feature columns",
+            options=numeric_cols,
+            default=[c for c in cfg.get("feature_cols", []) if c in numeric_cols],
+            help="Numeric sequence inputs used by the LSTM.",
+        )
+
+        if cfg.get("task_mode", "Regression") == "Classification":
+            options = [c for c in all_cols if c != cfg.get("date_col")]
+            current = cfg.get("classification_target_col")
+            idx = options.index(current) if current in options else 0
+
+            cfg["classification_target_col"] = st.selectbox(
+                "Classification target column",
+                options=options,
+                index=idx,
             )
-        with a3:
-            if cfg.get("task_mode", "Regression") == "Classification":
-                options = [c for c in all_cols if c != cfg.get("date_col")]
-                current = cfg.get("classification_target_col")
-                idx = options.index(current) if current in options else 0
-                cfg["classification_target_col"] = st.selectbox("Classification target column", options=options, index=idx)
-                cfg["target_cols"] = [cfg["classification_target_col"]]
-            else:
-                cfg["target_cols"] = st.multiselect(
-                    "Regression target column(s)",
-                    options=numeric_cols,
-                    default=[c for c in cfg.get("target_cols", []) if c in numeric_cols],
-                    help="Numeric future value(s) the LSTM forecasts.",
-                )
+            cfg["target_cols"] = [cfg["classification_target_col"]]
+        else:
+            cfg["target_cols"] = st.multiselect(
+                "Regression target column(s)",
+                options=numeric_cols,
+                default=[c for c in cfg.get("target_cols", []) if c in numeric_cols],
+                help="Numeric future value(s) the LSTM forecasts.",
+            )
 
         b1, b2 = st.columns(2)
         with b1:
