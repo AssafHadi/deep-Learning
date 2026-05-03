@@ -403,3 +403,78 @@ def cnn_render_uploaded_images_section(
     st.warning(
         "Image prediction is available from the Predict page after a CNN model is trained or loaded."
     )
+def ann_inject_css() -> None:
+    _inject_home_css("ANN")
+
+
+def ann_hero() -> None:
+    _inject_home_css("ANN")
+    _render_hero(MODEL_CONTENT["ANN"])
+
+
+def cnn_inject_css() -> None:
+    _inject_home_css("CNN")
+
+
+def cnn_hero() -> None:
+    _inject_home_css("CNN")
+    _render_hero(MODEL_CONTENT["CNN"])
+
+
+def cnn_status_bar() -> None:
+    df = st.session_state.get("dataset_df")
+    class_names = st.session_state.get("class_names", [])
+    trained_model = st.session_state.get("trained_model")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Samples", 0 if df is None else len(df))
+    c2.metric("Classes", len(class_names))
+    c3.metric("Input", "ZIP images")
+    c4.metric("Task", "Trained" if trained_model is not None else "Not trained")
+
+
+def lstm_inject_css() -> None:
+    _inject_home_css("LSTM")
+
+
+def lstm_hero(title: str, subtitle: str) -> None:
+    _inject_home_css("LSTM")
+
+    st.markdown(
+        f"""
+        <div class="home-hero">
+            <h2>{title}</h2>
+            <div>{subtitle}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def lstm_info_card(title: str, body: str) -> None:
+    st.markdown(
+        f"""
+        <div class="home-card">
+            <h4>{title}</h4>
+            <p>{body}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def lstm_top_status_bar() -> None:
+    df = st.session_state.get("raw_df")
+    cfg = st.session_state.get("config", {})
+    training = st.session_state.get("training")
+
+    trained = False
+    if isinstance(training, dict):
+        trained = training.get("model") is not None
+    trained = trained or st.session_state.get("model") is not None
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows", 0 if df is None else len(df))
+    c2.metric("Features", len(cfg.get("feature_cols", []) or []))
+    c3.metric("Targets", len(cfg.get("target_cols", []) or []))
+    c4.metric("Task", "Trained" if trained else "Not trained")
