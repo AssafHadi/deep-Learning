@@ -82,7 +82,7 @@ def render_ann_train_ui():
             "Epochs",
             min_value=1,
             max_value=5000,
-            value=int(cfg.get("epochs", 50)),
+            value=int(cfg.get("epochs", 200)),
             step=1,
             key="ann_train_epochs",
         )
@@ -92,7 +92,7 @@ def render_ann_train_ui():
             "Batch size",
             min_value=1,
             max_value=2048,
-            value=int(cfg.get("batch_size", 32)),
+            value=int(cfg.get("batch_size", 8)),
             step=1,
             key="ann_train_batch_size",
         )
@@ -112,8 +112,8 @@ def render_ann_train_ui():
         cfg["patience"] = st.number_input(
             "Early stopping patience",
             min_value=1,
-            max_value=200,
-            value=int(cfg.get("patience", 10)),
+            max_value=2000,
+            value=int(cfg.get("patience", 200)),
             step=1,
             key="ann_train_patience",
         )
@@ -314,12 +314,12 @@ def render_lstm_train_ui():
 
     c1, c2, c3, c4 = st.columns(4)
 
-    with c1:
+        with c1:
         cfg["epochs"] = st.number_input(
             "Epochs",
             min_value=1,
             max_value=1000,
-            value=int(cfg["epochs"]),
+            value=int(cfg.get("epochs", 200)),
             step=1,
         )
 
@@ -328,7 +328,7 @@ def render_lstm_train_ui():
             "Batch size",
             min_value=1,
             max_value=1024,
-            value=int(cfg["batch_size"]),
+            value=int(cfg.get("batch_size", 8)),
             step=1,
         )
 
@@ -337,7 +337,7 @@ def render_lstm_train_ui():
             "Learning rate",
             min_value=1e-6,
             max_value=1.0,
-            value=float(cfg["learning_rate"]),
+            value=float(cfg.get("learning_rate", 0.001)),
             format="%.6f",
         )
 
@@ -345,8 +345,8 @@ def render_lstm_train_ui():
         cfg["patience"] = st.number_input(
             "Early stopping patience",
             min_value=1,
-            max_value=200,
-            value=int(cfg["patience"]),
+            max_value=2000,
+            value=int(cfg.get("patience", 200)),
             step=1,
         )
 
