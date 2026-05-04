@@ -319,7 +319,7 @@ def render_lstm_train_ui():
             "Epochs",
             min_value=1,
             max_value=1000,
-            value=int(cfg.get("epochs", 100)),
+            value=int(cfg.get("epochs", 200)),
             step=1,
             key="lstm_train_epochs",
         )
