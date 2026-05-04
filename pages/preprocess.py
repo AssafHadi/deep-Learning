@@ -165,6 +165,7 @@ def render_cnn_preprocess_ui():
 
 def render_lstm_preprocess_ui():
     lstm_hero("Preprocess", "Choose columns, clean the series, split it sequentially, and build LSTM windows.")
+
     df = st.session_state.get("raw_df")
     if df is None:
         st.info("Load data first.")
@@ -177,15 +178,19 @@ def render_lstm_preprocess_ui():
 
     if guessed_date and (cfg.get("date_col") is None or cfg.get("date_col") not in df.columns):
         cfg["date_col"] = guessed_date
+
     if not cfg.get("feature_cols"):
         cfg["feature_cols"] = numeric_cols[:]
+
     if cfg.get("task_mode", "Regression") == "Regression" and not cfg.get("target_cols"):
         cfg["target_cols"] = numeric_cols[: min(1, len(numeric_cols))]
+
     if cfg.get("task_mode", "Regression") == "Classification" and not cfg.get("classification_target_col"):
         non_date_cols = [c for c in all_cols if c != cfg.get("date_col")]
         cfg["classification_target_col"] = non_date_cols[0] if non_date_cols else None
 
-            st.markdown("#### Column selection and sequence setup")
+    with st.form("preprocess_form"):
+        st.markdown("#### Column selection and sequence setup")
 
         date_options = [None] + all_cols
         date_index = date_options.index(cfg["date_col"]) if cfg.get("date_col") in date_options else 0
@@ -213,7 +218,9 @@ def render_lstm_preprocess_ui():
                 options=options,
                 index=idx,
             )
+
             cfg["target_cols"] = [cfg["classification_target_col"]]
+
         else:
             cfg["target_cols"] = st.multiselect(
                 "Regression target column(s)",
@@ -223,13 +230,29 @@ def render_lstm_preprocess_ui():
             )
 
         b1, b2 = st.columns(2)
+
         with b1:
-            cfg["lookback"] = st.number_input("Lookback window", min_value=2, max_value=365, value=int(cfg["lookback"]), step=1)
+            cfg["lookback"] = st.number_input(
+                "Lookback window",
+                min_value=2,
+                max_value=365,
+                value=int(cfg["lookback"]),
+                step=1,
+            )
+
         with b2:
-            cfg["horizon"] = st.number_input("Forecast horizon", min_value=1, max_value=30, value=int(cfg["horizon"]), step=1)
+            cfg["horizon"] = st.number_input(
+                "Forecast horizon",
+                min_value=1,
+                max_value=30,
+                value=int(cfg["horizon"]),
+                step=1,
+            )
 
         st.markdown("#### Cleaning, scaling, and split")
+
         c1, c2, c3 = st.columns(3)
+
         with c1:
             cfg["transform_mode"] = st.selectbox(
                 "Feature/target transform",
@@ -237,42 +260,94 @@ def render_lstm_preprocess_ui():
                 index=["raw", "pct_change", "log_return"].index(cfg["transform_mode"]),
                 help="For classification, this is applied only to numeric input features, not to the class target.",
             )
+
             cfg["missing_method"] = st.selectbox(
                 "Missing value handling",
                 ["ffill_bfill", "interpolate", "drop", "ffill", "bfill", "median_impute"],
                 index=["ffill_bfill", "interpolate", "drop", "ffill", "bfill", "median_impute"].index(cfg["missing_method"]),
             )
+
             resample_options = ["None", "D", "W", "M"]
+
             if cfg.get("task_mode") == "Classification":
                 resample_options = ["None"]
                 cfg["resample_rule"] = "None"
-            cfg["resample_rule"] = st.selectbox("Resample rule", resample_options, index=resample_options.index(cfg["resample_rule"]))
-        with c2:
-            cfg["scale_method"] = st.selectbox("Scaling", ["standard", "minmax", "robust"], index=["standard", "minmax", "robust"].index(cfg["scale_method"]))
-            cfg["train_frac"] = st.slider("Train fraction", min_value=0.50, max_value=0.85, value=float(cfg["train_frac"]), step=0.05)
-            cfg["val_frac"] = st.slider("Validation fraction", min_value=0.05, max_value=0.30, value=float(cfg["val_frac"]), step=0.05)
-        with c3:
-            cfg["clip_outliers"] = st.checkbox("Clip outliers by quantile", value=bool(cfg["clip_outliers"]))
-            cfg["clip_low_q"] = st.number_input("Lower quantile", min_value=0.0, max_value=0.20, value=float(cfg["clip_low_q"]), step=0.005)
-            cfg["clip_high_q"] = st.number_input("Upper quantile", min_value=0.80, max_value=1.0, value=float(cfg["clip_high_q"]), step=0.005)
 
-        submitted = st.form_submit_button("Run Preprocessing", use_container_width=True)
+            cfg["resample_rule"] = st.selectbox(
+                "Resample rule",
+                resample_options,
+                index=resample_options.index(cfg["resample_rule"]),
+            )
+
+        with c2:
+            cfg["scale_method"] = st.selectbox(
+                "Scaling",
+                ["standard", "minmax", "robust"],
+                index=["standard", "minmax", "robust"].index(cfg["scale_method"]),
+            )
+
+            cfg["train_frac"] = st.slider(
+                "Train fraction",
+                min_value=0.50,
+                max_value=0.85,
+                value=float(cfg["train_frac"]),
+                step=0.05,
+            )
+
+            cfg["val_frac"] = st.slider(
+                "Validation fraction",
+                min_value=0.05,
+                max_value=0.30,
+                value=float(cfg["val_frac"]),
+                step=0.05,
+            )
+
+        with c3:
+            cfg["clip_outliers"] = st.checkbox(
+                "Clip outliers by quantile",
+                value=bool(cfg["clip_outliers"]),
+            )
+
+            cfg["clip_low_q"] = st.number_input(
+                "Lower quantile",
+                min_value=0.0,
+                max_value=0.20,
+                value=float(cfg["clip_low_q"]),
+                step=0.005,
+            )
+
+            cfg["clip_high_q"] = st.number_input(
+                "Upper quantile",
+                min_value=0.80,
+                max_value=1.0,
+                value=float(cfg["clip_high_q"]),
+                step=0.005,
+            )
+
+        submitted = st.form_submit_button(
+            "Run Preprocessing",
+            use_container_width=True,
+        )
 
     if submitted:
         try:
             if cfg["train_frac"] + cfg["val_frac"] >= 0.95:
                 raise ValueError("Train fraction + validation fraction must leave room for a test set.")
+
             processed = lstm_preprocess_dataset(df, cfg)
             st.session_state["processed"] = processed
             st.session_state["training"] = None
             st.session_state["prediction"] = None
             st.success("Preprocessing complete.")
+
         except Exception as e:
             st.error(f"Preprocessing failed: {e}")
 
     processed = st.session_state.get("processed")
+
     if processed is not None:
         st.markdown("### Processed Dataset Summary")
+
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Task", processed["task"].title())
         c2.metric("Train Sequences", len(processed["X_train"]))
@@ -285,7 +360,16 @@ def render_lstm_preprocess_ui():
         c7.metric("Features", len(processed["feature_cols"]))
         c8.metric("Target", processed["target_col"])
 
-        st.pyplot(lstm_fig_split_overview(processed["dates"], processed["train_end_idx"], processed["val_end_idx"], "Sequential Train / Validation / Test Split"), use_container_width=True)
+        st.pyplot(
+            lstm_fig_split_overview(
+                processed["dates"],
+                processed["train_end_idx"],
+                processed["val_end_idx"],
+                "Sequential Train / Validation / Test Split",
+            ),
+            use_container_width=True,
+        )
+
         st.dataframe(
             pd.DataFrame({
                 "setting": ["Task", "Date column", "Features", "Target", "Frequency", "Transform", "Scaling"],
