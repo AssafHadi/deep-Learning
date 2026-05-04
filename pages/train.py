@@ -82,7 +82,7 @@ def render_ann_train_ui():
             "Epochs",
             min_value=1,
             max_value=5000,
-            value=int(cfg.get("epochs", 200)),
+            value=int(cfg.get("epochs", 100)),
             step=1,
             key="ann_train_epochs",
         )
@@ -314,13 +314,14 @@ def render_lstm_train_ui():
 
     c1, c2, c3, c4 = st.columns(4)
 
-        with c1:
+    with c1:
         cfg["epochs"] = st.number_input(
             "Epochs",
             min_value=1,
             max_value=1000,
-            value=int(cfg.get("epochs", 200)),
+            value=int(cfg.get("epochs", 100)),
             step=1,
+            key="lstm_train_epochs",
         )
 
     with c2:
@@ -330,6 +331,7 @@ def render_lstm_train_ui():
             max_value=1024,
             value=int(cfg.get("batch_size", 8)),
             step=1,
+            key="lstm_train_batch_size",
         )
 
     with c3:
@@ -338,7 +340,9 @@ def render_lstm_train_ui():
             min_value=1e-6,
             max_value=1.0,
             value=float(cfg.get("learning_rate", 0.001)),
+            step=0.0001,
             format="%.6f",
+            key="lstm_train_learning_rate",
         )
 
     with c4:
@@ -348,7 +352,10 @@ def render_lstm_train_ui():
             max_value=2000,
             value=int(cfg.get("patience", 200)),
             step=1,
+            key="lstm_train_patience",
         )
+
+    st.session_state["config"] = cfg
 
     if processed.get("task") == "regression":
         cfg["loss"] = st.selectbox(
